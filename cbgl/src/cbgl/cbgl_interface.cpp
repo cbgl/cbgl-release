@@ -1,0 +1,1258 @@
+// Copyright 2026 Alexandros Filotheou
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+/**
+ * @brief `cbgl::Interface`.
+ */
+#include "cbgl/cbgl_interface.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <format>
+#include <functional>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
+#include <tf2/LinearMath/Matrix3x3.hpp>
+#include <tf2/LinearMath/Quaternion.hpp>
+#include <tf2/LinearMath/Vector3.hpp>
+
+#include "cbgl/free_space.hpp"
+#include "cbgl/map_file.hpp"
+
+namespace cbgl
+{
+namespace
+{
+/**
+ * @brief What is wrong with a scan's own angles, for an algorithm that reads a
+ * scan as centred on the sensor's heading.
+ * @details The angles a scan carries are the only place it says what aperture
+ * it was taken at, and the algorithm below reads the middle window of a cast
+ * against it. A scan whose first ray sits somewhere other than half its own
+ * span behind the heading is a legal scan and a wrong answer here, rotated by
+ * whatever the two conventions differ by, so it is refused rather than read as
+ * though it agreed. One ray of slack is allowed, which is more than the
+ * rounding of a float: a span or a first ray is refused only where it is out
+ * by more than `angle_increment`.
+ * A first angle or a spacing that is not finite is refused too, by name.
+ * Every comparison with not a number is false, and an infinite spacing gives
+ * an infinite span and an infinite slack, so neither would fail the tests on
+ * the span and on the first ray. A first angle of not a number would then be
+ * turned into an index of the scan where it is sampled, which is undefined.
+ * A scan spanning less than a turn is accepted. It was not before: this
+ * package localised panoramic sensors and nothing else, and a narrower one was
+ * refused here rather than answered wrongly. What supports it now is the
+ * window in the sift and in the refinement, which cast a whole turn at the
+ * angular resolution of the scan they work from and compare only the part of
+ * it the sensor could have seen.
+ * @return an empty string when the scan's angles are ones this can read,
+ * otherwise a sentence naming the field and the value it carried.
+ */
+std::string anglesProblemOf(const sensor_msgs::msg::LaserScan& scan)
+{
+  const double rays = static_cast<double>(scan.ranges.size());
+  const double increment = scan.angle_increment;
+  const double slack = std::abs(increment) > 0.0
+    ? std::abs(increment) : 2.0 * M_PI / std::max(1.0, rays);
+
+  if (!(increment > 0.0) || !std::isfinite(increment))
+  {
+    return std::format("the scan carries angle_increment {}, which is not a "
+      "spacing rays can be laid out at", increment);
+  }
+
+  const double aperture = rays * increment;
+
+  if (aperture > 2.0 * M_PI + slack)
+  {
+    return std::format("the scan carries {} ranges at angle_increment {}, "
+      "which spans {} radians, more than a full turn. A ray of such a scan "
+      "would be read twice", scan.ranges.size(), increment, aperture);
+  }
+
+  const double expected_min = -0.5 * aperture;
+
+  if (!std::isfinite(scan.angle_min) ||
+    std::abs(FSM::Utils::wrapAngle(scan.angle_min - expected_min)) > slack)
+  {
+    return std::format("the scan carries angle_min {}, where a scan spanning "
+      "{} radians is read as centred on the sensor's heading and therefore as "
+      "beginning at {}", scan.angle_min, aperture, expected_min);
+  }
+
+  return {};
+}
+
+/**
+ * @brief `b`, which is expressed in the frame `a` places, expressed in the
+ * frame `a` is expressed in.
+ */
+Pose compose(const Pose& a, const Pose& b)
+{
+  const double cos_t = std::cos(a.t);
+  const double sin_t = std::sin(a.t);
+
+  return Pose{
+    a.x + cos_t * b.x - sin_t * b.y,
+    a.y + sin_t * b.x + cos_t * b.y,
+    FSM::Utils::wrapAngle(a.t + b.t)};
+}
+
+unsigned int countOf(const rclcpp::Node& node, const std::string& name)
+{
+  const std::int64_t value = node.get_parameter(name).as_int();
+
+  if (value < 0)
+  {
+    const std::string problem =
+      std::format("{} must not be negative, got {}", name, value);
+    RCLCPP_FATAL(node.get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  return static_cast<unsigned int>(value);
+}
+
+/**
+ * @brief The pose that undoes `a`: where the frame `a` is expressed in sits,
+ * expressed in the frame `a` places.
+ */
+Pose invert(const Pose& a)
+{
+  const double cos_t = std::cos(a.t);
+  const double sin_t = std::sin(a.t);
+
+  return Pose{
+    -(cos_t * a.x + sin_t * a.y),
+    -(-sin_t * a.x + cos_t * a.y),
+    FSM::Utils::wrapAngle(-a.t)};
+}
+
+/**
+ * @brief The ranges a scan carries, each reading outside the scan's own limits
+ * made missing.
+ * @details By the convention a `sensor_msgs::msg::LaserScan` follows, a
+ * reading below `range_min` or above `range_max` is not a distance to anything.
+ * The algorithm takes every finite reading above nought as a return, so such a
+ * reading would be read as a wall the sensor never saw: one touching the
+ * sensor, or one farther away than it can see. It is made not a number, which
+ * is how the algorithm already reads a reading the sensor did not make. A
+ * reading equal to either limit is a return.
+ */
+std::vector<double> rangesOf(const sensor_msgs::msg::LaserScan& scan)
+{
+  std::vector<double> ranges(scan.ranges.begin(), scan.ranges.end());
+
+  std::ranges::replace_if(ranges,
+    [&scan](const double range)
+    {
+      return range < scan.range_min || range > scan.range_max;
+    },
+    std::numeric_limits<double>::quiet_NaN());
+
+  return ranges;
+}
+
+/**
+ * @brief A descriptor marking a setting read only.
+ * @details Every setting is read once, at construction, and nothing reads one
+ * again. A value set while the node runs would therefore be accepted and would
+ * change nothing, which is a setting that has quietly stopped meaning what it
+ * says. Read only turns such a change into a refusal instead.
+ */
+rcl_interfaces::msg::ParameterDescriptor readOnly()
+{
+  rcl_interfaces::msg::ParameterDescriptor descriptor;
+  descriptor.read_only = true;
+
+  return descriptor;
+}
+
+/**
+ * @brief The rotation a quaternion carries, whole.
+ * @return the rotation, or `std::nullopt` where the quaternion is not finite
+ * or has no length to be normalised by.
+ */
+std::optional<tf2::Matrix3x3> rotationOf(
+  const geometry_msgs::msg::Quaternion& orientation)
+{
+  if (!std::isfinite(orientation.x) || !std::isfinite(orientation.y) ||
+    !std::isfinite(orientation.z) || !std::isfinite(orientation.w))
+  {
+    return std::nullopt;
+  }
+
+  const double norm_squared =
+    orientation.x * orientation.x + orientation.y * orientation.y +
+    orientation.z * orientation.z + orientation.w * orientation.w;
+
+  constexpr double kMinimumQuaternionNormSquared = 1e-9;
+
+  if (norm_squared < kMinimumQuaternionNormSquared)
+    return std::nullopt;
+
+  return tf2::Matrix3x3(tf2::Quaternion(
+    orientation.x, orientation.y, orientation.z, orientation.w));
+}
+
+/**
+ * @brief Holds the flag that refuses a second run raised for as long as one run
+ * lasts.
+ * @details Lowering the flag on the way out of the scope is what makes the
+ * invariant hold whichever way a run ends, an exception included. The sift
+ * rethrows what one of its threads caught on the thread that called it, so a
+ * run that ran out of memory on a large map arrives here, and a flag left
+ * raised by such a run would refuse every request made afterwards.
+ */
+class RunFlag
+{
+public:
+  RunFlag(std::mutex& mutex, bool& running)
+  : mutex_(mutex), running_(running)
+  {
+  }
+
+  ~RunFlag()
+  {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    running_ = false;
+  }
+
+  RunFlag(const RunFlag&) = delete;
+  RunFlag& operator=(const RunFlag&) = delete;
+  RunFlag(RunFlag&&) = delete;
+  RunFlag& operator=(RunFlag&&) = delete;
+
+private:
+  std::mutex& mutex_;
+  bool& running_;
+};
+
+/**
+ * @brief The quality of service a scan is subscribed at.
+ * @return the profile, or `std::nullopt` where `reliability` is neither
+ * `"reliable"` nor `"best_effort"`. Nothing else in this package judges that
+ * name, so the two spellings are known here and nowhere else.
+ */
+std::optional<rclcpp::QoS> scanQos(const std::string& reliability,
+  const unsigned int depth)
+{
+  rclcpp::QoS qos(static_cast<std::size_t>(depth));
+
+  if (reliability == "reliable")
+    return qos.reliable();
+
+  if (reliability == "best_effort")
+    return qos.best_effort();
+
+  return std::nullopt;
+}
+
+/**
+ * @brief What the matcher's refusal of one survivor amounts to, as a phrase a
+ * count can be put in front of.
+ */
+std::string sentenceOf(const fsm_localisation::CorrectionError error)
+{
+  switch (error)
+  {
+    case fsm_localisation::CorrectionError::scan_too_short:
+      return "a scan carrying fewer ranges than size_scan asks to match at";
+    case fsm_localisation::CorrectionError::scan_entirely_invalid:
+      return "a scan carrying no usable range";
+    case fsm_localisation::CorrectionError::estimate_not_in_free_space:
+      return "a survivor standing outside the map or on a blocked cell";
+    case fsm_localisation::CorrectionError::first_cast_entirely_at_max_range:
+      return "a survivor from which every cast ray leaves the map";
+    case fsm_localisation::CorrectionError::recovery_budget_exhausted:
+      return "a match that spent its whole recovery budget without settling";
+    case fsm_localisation::CorrectionError::aperture_not_a_sensor:
+      return "an aperture no sensor can cover, which the node's own gate on "
+        "the scan should have refused before a survivor was ever refined";
+  }
+
+  return "a refusal the matcher did not name";
+}
+
+/**
+ * @brief Why the library produced no pose, in words a caller can act on.
+ * @details The reason that carries per survivor counts says how many survivors
+ * went each way, since how the refinement failed is what tells a badly bounded
+ * search from a map the sensor cannot see anything in.
+ */
+std::string sentenceOf(const Error& error)
+{
+  std::string counted;
+
+  const auto count = [&counted](const auto& refusals)
+    {
+      for (const auto& [reason, refused] : refusals)
+      {
+        counted += std::format("{}{} for {}", counted.empty() ? "" : ", ",
+          refused, sentenceOf(reason));
+      }
+    };
+
+  count(error.refusals);
+
+  const std::string counts = counted.empty() ? "" : ": " + counted;
+
+  switch (error.reason)
+  {
+    case Error::Reason::every_survivor_refused:
+      return "the matcher refused every survivor of the sift" + counts;
+    case Error::Reason::map_has_no_free_space:
+      return "the map carries no free cell, so there is nowhere to place a "
+        "hypothesis";
+    case Error::Reason::no_hypotheses_given:
+      return "no hypothesis was drawn to search";
+    case Error::Reason::no_scorable_pose:
+      return "the map casts nothing from any refined pose, so none of them can "
+        "be scored" + counts;
+    case Error::Reason::scan_angles_invalid:
+      return "the scan's aperture is not above nought or not finite, or its "
+        "angle_min is not finite. A scan carrying no rays at all has an "
+        "aperture of nought";
+    case Error::Reason::scan_entirely_invalid:
+      return "no range in the scan is usable";
+    case Error::Reason::scan_too_short:
+      return "the scan carries fewer ranges than size_scan asks to work at";
+  }
+
+  return "the localisation failed for an unrecognised reason";
+}
+
+/**
+ * @brief A scan's ranges in the order an upright sensor reports them, and
+ * where on the robot that upright sensor stands.
+ */
+struct UprightScan
+{
+  Pose sensor;
+  std::vector<double> ranges;
+};
+
+/**
+ * @brief `scan` as an upright sensor would have reported it, and where on the
+ * robot that sensor stands.
+ * @details An upright sensor's ray `k` lies at heading `h + a_k` on the robot,
+ * where `h` is the heading of the sensor's x axis and
+ * `a_k = angle_min + k * angle_increment`, and the algorithm reads every scan
+ * as an upright sensor's. A sensor whose z axis points down sweeps the other
+ * way, so its ray `j` lies at `h - a_j`, and reading it as `h + a_j` reads the
+ * mirror image of the room.
+ * Reversing the ranges puts them back in counterclockwise order. Ray `k` of
+ * the reversed scan is ray `n - 1 - k` of the scan, which lies at
+ * `h - angle_min - (n - 1 - k) * angle_increment`, and that is
+ * `(h - s) + a_k` with `s = 2 * angle_min + (n - 1) * angle_increment`, the
+ * sum of the scan's first and last angles. The reversed scan is therefore
+ * exactly what an upright sensor with the same angles reports from heading
+ * `h - s`, and it is handed over as that sensor's. No ray is dropped or
+ * interpolated, and whatever is done downstream with an upright scan's angles
+ * is done with these in the same way.
+ * The ranges either way are those `rangesOf` gives, so a reading outside the
+ * scan's own limits reaches the algorithm already missing.
+ * @remark `s` is nought for a scan symmetric about the sensor's heading, and
+ * there the reversal alone is the mirror. It is minus one ray for a panoramic
+ * scan beginning at minus pi, and a reversal without the turn would rotate the
+ * answer by that ray.
+ */
+UprightScan uprightScanOf(const sensor_msgs::msg::LaserScan& scan,
+  const Pose& placement, const bool upside_down)
+{
+  if (!upside_down)
+  {
+    return UprightScan{
+      .sensor = placement,
+      .ranges = rangesOf(scan)};
+  }
+
+  const std::vector<double> ranges = rangesOf(scan);
+
+  const double rays = static_cast<double>(scan.ranges.size());
+  const double skew =
+    2.0 * scan.angle_min + (rays - 1.0) * scan.angle_increment;
+
+  return UprightScan{
+    .sensor = Pose{
+      .x = placement.x,
+      .y = placement.y,
+      .t = FSM::Utils::wrapAngle(placement.t - skew)},
+    .ranges = std::vector<double>(ranges.rbegin(), ranges.rend())};
+}
+
+}
+
+/**
+ * @details Every refusal a setting can earn is decided here, before a
+ * subscription, a publisher or a service exists, so that the node either comes
+ * up usable or does not come up at all.
+ * Which of the two map routes is taken is decided here too, and once only. A
+ * named `map_topic` is subscribed and `map_file` is then ignored with a word
+ * said about it, because a topic can deliver a second map and a file cannot. An
+ * empty `map_topic` and a named `map_file` read that file now, and a file that
+ * cannot be read or cannot be localised in is a refusal to start rather than a
+ * node standing by for a map that will never arrive. Both empty is refused
+ * outright.
+ * The transform listener and the transform broadcaster are handed plain
+ * subscription and publisher options rather than their own defaults, which ask
+ * for quality of service overrides and would declare eleven parameters on this
+ * node under names no documentation of its settings mentions.
+ * The diagnostic sink takes a copy of the logger rather than the node itself,
+ * since the sink it is installed in outlives any one node and a process is free
+ * to construct more than one.
+ */
+Interface::Interface(const rclcpp::NodeOptions& options)
+: rclcpp::Node("cbgl", options)
+{
+  declareParameters();
+
+  parameters_ = readParameters();
+
+  if (const std::string problem = validate(parameters_); !problem.empty())
+  {
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  const std::optional<fsm_localisation::CastingMethod> method =
+    fsm_localisation::castingMethodFromName(parameters_.matcher.map_scan_method);
+
+  if (!method.has_value())
+  {
+    const std::string problem = std::format(
+      "map_scan_method must be \"ray_marching\", \"bresenham\" or \"cddt\", "
+      "got \"{}\"", parameters_.matcher.map_scan_method);
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  casting_method_ = *method;
+
+  const std::string refinement =
+    get_parameter("refinement_method").as_string();
+
+  if (refinement != "fsm" && refinement != "none")
+  {
+    const std::string problem = std::format(
+      "refinement_method must be \"fsm\" or \"none\", got \"{}\"",
+      refinement);
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  parameters_.refine = refinement != "none";
+
+  const std::string reliability =
+    get_parameter("scan_qos_reliability").as_string();
+
+  const unsigned int scan_qos_depth = countOf(*this, "scan_qos_depth");
+
+  if (scan_qos_depth == 0U)
+  {
+    const std::string problem = std::format(
+      "scan_qos_depth must be greater than zero, got {}", scan_qos_depth);
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  const std::optional<rclcpp::QoS> scan_qos = scanQos(reliability,
+    scan_qos_depth);
+
+  if (!scan_qos.has_value())
+  {
+    const std::string problem = std::format(
+      "scan_qos_reliability must be \"reliable\" or \"best_effort\", got "
+      "\"{}\"", reliability);
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  const double timeout = get_parameter("tf_lookup_timeout").as_double();
+
+  if (!std::isfinite(timeout) || timeout < 0.0)
+  {
+    const std::string problem = std::format(
+      "tf_lookup_timeout must be a finite number and must not be negative, "
+      "got {}", timeout);
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  tf_lookup_timeout_ = rclcpp::Duration::from_seconds(timeout);
+
+  fixed_frame_id_ = get_parameter("fixed_frame_id").as_string();
+  odom_frame_id_ = get_parameter("odom_frame_id").as_string();
+  base_frame_id_ = get_parameter("base_frame_id").as_string();
+
+  for (const auto& [name, value] : {
+      std::pair<std::string, std::string>{"fixed_frame_id", fixed_frame_id_},
+      {"odom_frame_id", odom_frame_id_},
+      {"base_frame_id", base_frame_id_}})
+  {
+    if (value.empty() || value.front() == '/')
+    {
+      const std::string problem = std::format(
+        "{} must name a frame and must not begin with a slash, got \"{}\"",
+        name, value);
+      RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+      throw std::invalid_argument(problem);
+    }
+  }
+
+  map_topic_ = get_parameter("map_topic").as_string();
+  scan_topic_ = get_parameter("scan_topic").as_string();
+
+  const std::string map_file = get_parameter("map_file").as_string();
+
+  const std::string output_pose_topic =
+    get_parameter("output_pose_topic").as_string();
+
+  for (const auto& [name, value] : {
+      std::pair<std::string, std::string>{"output_pose_topic",
+        output_pose_topic},
+      {"scan_topic", scan_topic_}})
+  {
+    if (value.empty())
+    {
+      const std::string problem = std::format("{} must name a topic", name);
+      RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+      throw std::invalid_argument(problem);
+    }
+  }
+
+  if (map_topic_.empty() && map_file.empty())
+  {
+    const std::string problem = "one of map_topic and map_file is required, "
+      "and both are empty: a map reaches this node either on a topic or from a "
+      "map description file on disk, and it cannot localise in no map at all";
+    RCLCPP_FATAL(get_logger(), "Refusing to start: %s", problem.c_str());
+    throw std::invalid_argument(problem);
+  }
+
+  if (!map_topic_.empty() && !map_file.empty())
+  {
+    RCLCPP_WARN(get_logger(),
+      "map_topic \"%s\" and map_file \"%s\" are both set. The topic wins and "
+      "the file is ignored, since a topic can deliver a second map and a file "
+      "cannot. Empty map_topic to localise in the file instead.",
+      map_topic_.c_str(), map_file.c_str());
+  }
+
+  initial_cov_aa_ = get_parameter("initial_cov_aa").as_double();
+  initial_cov_xx_ = get_parameter("initial_cov_xx").as_double();
+  initial_cov_yy_ = get_parameter("initial_cov_yy").as_double();
+
+  tf_broadcast_ = get_parameter("tf_broadcast").as_bool();
+
+  fsm_localisation::setDiagnosticSink(
+    [logger = get_logger()](const std::string& message)
+    {
+      RCLCPP_INFO(logger, "%s", message.c_str());
+    });
+
+  if (map_topic_.empty())
+  {
+    const std::expected<nav_msgs::msg::OccupancyGrid, std::string> described =
+      mapFromFile(map_file);
+
+    if (!described.has_value())
+    {
+      RCLCPP_FATAL(get_logger(), "Refusing to start: %s",
+        described.error().c_str());
+      throw std::invalid_argument(described.error());
+    }
+
+    nav_msgs::msg::OccupancyGrid map = *described;
+    map.header.frame_id = fixed_frame_id_;
+
+    if (const std::string problem = takeMap(map); !problem.empty())
+    {
+      const std::string refusal = std::format(
+        "the map described by {} cannot be localised in: {}", map_file,
+        problem);
+      RCLCPP_FATAL(get_logger(), "Refusing to start: %s", refusal.c_str());
+      throw std::invalid_argument(refusal);
+    }
+  }
+
+  transform_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+  transform_listener_ = std::make_shared<tf2_ros::TransformListener>(
+    *transform_buffer_, this, true, tf2_ros::DynamicListenerQoS(),
+    tf2_ros::StaticListenerQoS(), rclcpp::SubscriptionOptions(),
+    rclcpp::SubscriptionOptions());
+
+  if (tf_broadcast_)
+  {
+    transform_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(
+      *this, tf2_ros::DynamicBroadcasterQoS(), rclcpp::PublisherOptions());
+  }
+
+  pose_publisher_ =
+    create_publisher<geometry_msgs::msg::PoseWithCovarianceStamped>(
+      output_pose_topic, 1);
+
+  const std::string hypotheses_topic =
+    get_parameter("hypotheses_topic").as_string();
+
+  if (!hypotheses_topic.empty())
+  {
+    hypotheses_publisher_ = create_publisher<geometry_msgs::msg::PoseArray>(
+      hypotheses_topic, 1);
+  }
+
+  const std::string top_hypotheses_topic =
+    get_parameter("top_hypotheses_topic").as_string();
+
+  if (!top_hypotheses_topic.empty())
+  {
+    top_hypotheses_publisher_ = create_publisher<geometry_msgs::msg::PoseArray>(
+      top_hypotheses_topic, 1);
+  }
+
+  const std::string map_scan_topic =
+    get_parameter("map_scan_topic").as_string();
+
+  if (!map_scan_topic.empty())
+  {
+    map_scan_publisher_ = create_publisher<sensor_msgs::msg::LaserScan>(
+      map_scan_topic, 1);
+  }
+
+  if (!map_topic_.empty())
+  {
+    map_subscription_ = create_subscription<nav_msgs::msg::OccupancyGrid>(
+      map_topic_, rclcpp::QoS(1).transient_local(),
+      [this](nav_msgs::msg::OccupancyGrid::ConstSharedPtr map)
+      {
+        mapCallback(std::move(map));
+      });
+  }
+
+  scan_subscription_ = create_subscription<sensor_msgs::msg::LaserScan>(
+    scan_topic_, *scan_qos,
+    [this](sensor_msgs::msg::LaserScan::ConstSharedPtr scan)
+    {
+      scanCallback(std::move(scan));
+    });
+
+  service_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
+  global_localisation_service_ = create_service<std_srvs::srv::Trigger>(
+    "~/global_localisation",
+    std::bind(&Interface::globalLocalisation, this, std::placeholders::_1,
+      std::placeholders::_2),
+    rclcpp::ServicesQoS(), service_group_);
+
+  RCLCPP_INFO(get_logger(), "Refining by %s",
+    !parameters_.refine
+      ? "nothing: the sift's own best candidate is published as it stands"
+      : "the panoramic scan matcher, fsm_localisation");
+
+  RCLCPP_INFO(get_logger(),
+    "Standing by. To localise issue ros2 service call "
+    "%s/global_localisation std_srvs/srv/Trigger", get_name());
+}
+
+void Interface::declareParameters()
+{
+  declare_parameter("fixed_frame_id", "map", readOnly());
+  declare_parameter("base_frame_id", "base_footprint", readOnly());
+  declare_parameter("odom_frame_id", "odom", readOnly());
+  declare_parameter("tf_broadcast", false, readOnly());
+  declare_parameter("tf_lookup_timeout", 0.1, readOnly());
+
+  declare_parameter("scan_topic", "/scan", readOnly());
+  declare_parameter("map_topic", "/map", readOnly());
+  declare_parameter("map_file", "", readOnly());
+  declare_parameter("output_pose_topic", "/initialpose", readOnly());
+  declare_parameter("hypotheses_topic", "", readOnly());
+  declare_parameter("top_hypotheses_topic", "", readOnly());
+  declare_parameter("map_scan_topic", "", readOnly());
+
+  declare_parameter("scan_qos_reliability", "reliable", readOnly());
+  declare_parameter("scan_qos_depth", 1, readOnly());
+
+  declare_parameter("dl", 15.0, readOnly());
+  declare_parameter("da", 32, readOnly());
+  declare_parameter("top_k_caers", 10, readOnly());
+  declare_parameter("rng_seed", 0, readOnly());
+  declare_parameter("num_threads", 0, readOnly());
+  declare_parameter("occupancy_threshold", 65, readOnly());
+  declare_parameter("map_scan_method", "ray_marching", readOnly());
+
+  declare_parameter("refinement_method", "fsm", readOnly());
+
+  declare_parameter("size_scan", 0, readOnly());
+  declare_parameter("min_magnification_size", 0, readOnly());
+  declare_parameter("max_magnification_size", 3, readOnly());
+  declare_parameter("num_iterations", 2, readOnly());
+  declare_parameter("xy_bound", 0.2, readOnly());
+  declare_parameter("t_bound", M_PI / 4, readOnly());
+  declare_parameter("max_counter", 200, readOnly());
+  declare_parameter("max_recoveries", 10, readOnly());
+  declare_parameter("ray_search", "angular", readOnly());
+  declare_parameter("enforce_early_gearup", false, readOnly());
+  declare_parameter("enforce_translation_bound", false, readOnly());
+  declare_parameter("recover_on_failed_sift", false, readOnly());
+
+  declare_parameter("initial_cov_xx", 0.05, readOnly());
+  declare_parameter("initial_cov_yy", 0.05, readOnly());
+  declare_parameter("initial_cov_aa", 0.06854, readOnly());
+}
+
+/**
+ * @details The flag that refuses a second run is raised here and lowered by the
+ * guard on the way out, so that the run itself has one way in and one way out
+ * whichever way it ends. The service group is reentrant, which is what lets a
+ * second request be answered at once instead of waiting behind the run it is
+ * asking about.
+ * @remark A run that throws is answered rather than left silent. Nothing else
+ * about this node fails without a sentence, and a run that ran out of memory on
+ * a large map is exactly the failure whose sentence somebody needs.
+ */
+void Interface::globalLocalisation(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  {
+    const std::lock_guard<std::mutex> lock(held_mutex_);
+
+    if (running_)
+    {
+      response->success = false;
+      response->message = "a localisation is already under way; this request "
+        "is refused rather than queued behind it";
+      RCLCPP_ERROR(get_logger(), "No localisation: %s",
+        response->message.c_str());
+      return;
+    }
+
+    running_ = true;
+  }
+
+  const RunFlag flag(held_mutex_, running_);
+
+  try
+  {
+    localiseOnce(*response);
+  }
+  catch (const std::exception& problem)
+  {
+    response->success = false;
+    response->message = std::format("the localisation did not finish: {}",
+      problem.what());
+    RCLCPP_ERROR(get_logger(), "No localisation: %s",
+      response->message.c_str());
+  }
+}
+
+/**
+ * @details The hypothesis set is drawn here and handed to the library, rather
+ * than left to the library to draw for itself, because the set that is
+ * published has to be the set that was searched.
+ * Both placements the answer needs are read from the transform tree before the
+ * search begins, at the stamp the scan carries. Reading the odometry frame's
+ * placement afterwards would ask a tree that keeps ten seconds of history for a
+ * stamp a long run has left behind, and a run on a real building at the shipped
+ * hypothesis density takes longer than that.
+ * @remark The refusal for want of a map names the topic because that is the
+ * only route it can happen on. A node reading its map from a file holds that
+ * map from the end of its own construction, or it does not exist.
+ */
+void Interface::localiseOnce(std_srvs::srv::Trigger::Response& outcome)
+{
+  const auto refuse = [this, &outcome](const std::string& problem)
+    {
+      outcome.success = false;
+      outcome.message = problem;
+      RCLCPP_ERROR(get_logger(), "No localisation: %s", problem.c_str());
+    };
+
+  std::shared_ptr<const Localiser> localiser;
+  std::shared_ptr<const fsm_localisation::OccupancyGridMap> map;
+  sensor_msgs::msg::LaserScan::ConstSharedPtr scan;
+
+  {
+    const std::lock_guard<std::mutex> lock(held_mutex_);
+    localiser = localiser_;
+    map = map_;
+    scan = latest_scan_;
+  }
+
+  if (!localiser)
+  {
+    refuse("no map has arrived on " + map_topic_);
+    return;
+  }
+
+  if (!scan)
+  {
+    refuse("no scan has arrived on " + scan_topic_);
+    return;
+  }
+
+  if (const std::string problem = anglesProblemOf(*scan); !problem.empty())
+  {
+    refuse(problem);
+    return;
+  }
+
+  const rclcpp::Time stamp(scan->header.stamp);
+
+  const std::expected<Placement, std::string> placement =
+    sensorOnRobot(scan->header.frame_id, stamp);
+
+  if (!placement.has_value())
+  {
+    refuse(placement.error());
+    return;
+  }
+
+  std::optional<Pose> odometry;
+
+  if (tf_broadcast_)
+  {
+    const std::expected<Placement, std::string> odometry_placement =
+      placementOf(odom_frame_id_, base_frame_id_, stamp);
+
+    if (odometry_placement.has_value())
+      odometry = odometry_placement->pose;
+    else
+      RCLCPP_WARN(get_logger(), "Broadcasting nothing for this answer: %s",
+        odometry_placement.error().c_str());
+  }
+
+  const UprightScan upright =
+    uprightScanOf(*scan, placement->pose, placement->upside_down);
+  const std::vector<Pose> hypotheses = localiser->disperse();
+
+  const double aperture =
+    static_cast<double>(scan->ranges.size()) * scan->angle_increment;
+
+  const std::expected<Result, Error> result = localiser->localise(
+    upright.ranges, scan->range_max, hypotheses, aperture, scan->angle_min);
+
+  if (!result.has_value())
+  {
+    refuse(sentenceOf(result.error()));
+    return;
+  }
+
+  if (result->survivors.size() < parameters_.top_k_caers)
+  {
+    RCLCPP_WARN(get_logger(),
+      "The map offered %zu candidates where top_k_caers asks for %u, so every "
+      "one of them was refined.", result->num_candidates,
+      parameters_.top_k_caers);
+  }
+
+  const Pose robot = compose(result->pose, invert(upright.sensor));
+
+  publishPose(robot, stamp);
+
+  if (hypotheses_publisher_)
+    publishHypotheses(hypotheses, stamp);
+
+  if (top_hypotheses_publisher_)
+    publishTopHypotheses(result->survivors, stamp);
+
+  if (map_scan_publisher_)
+    publishMapScan(*map, *scan, result->pose, placement->upside_down, stamp);
+
+  if (odometry.has_value())
+    publishTransform(robot, *odometry, stamp);
+
+  unsigned int refused = 0U;
+
+  for (const auto& [reason, count] : result->refusals)
+    refused += count;
+
+  outcome.success = true;
+  outcome.message = std::format(
+    "localised in {:.0f} ms: {} candidates scored, {} survivors handed to the "
+    "matcher, {} of them refused", 1000.0 * result->execution_time,
+    result->num_candidates, result->survivors.size(), refused);
+
+  RCLCPP_INFO(get_logger(), "%s", outcome.message.c_str());
+}
+
+/**
+ * @details A map that arrives on the topic and is refused is said out loud and
+ * dropped, and whatever map the node already held it keeps. A run under way
+ * finishes against the map it started with either way.
+ * @remark Taking a map allocates: the blocked bitmap, the free space, and the
+ * casting table where that caster is configured. On a large map any of those
+ * can fail, and an exception leaving a callback takes the executor and the
+ * whole node with it. The service path guards the same hazard on the same map
+ * for the same reason, so this guards it too: a map that cannot be taken is a
+ * map to drop, not a node to lose.
+ */
+void Interface::mapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr map)
+{
+  try
+  {
+    if (const std::string problem = takeMap(*map); !problem.empty())
+      RCLCPP_ERROR(get_logger(), "Ignoring this map: %s", problem.c_str());
+  }
+  catch (const std::exception& ex)
+  {
+    RCLCPP_ERROR(get_logger(), "Ignoring this map: %s", ex.what());
+  }
+}
+
+/**
+ * @details The lookup is made at the stamp the scan carries rather than at the
+ * clock's idea of now, so a frame that has moved since the scan is placed where
+ * it was then. It carries a deadline for the same reason every lookup here
+ * does: a tree that has not caught up yet is worth waiting a moment for, and a
+ * tree
+ * that never carries the frame at all must not hold this thread for good.
+ * The whole rotation is read, not its yaw alone. The heading kept is that of
+ * the frame's x axis in the plane, and whether its z axis points down is kept
+ * beside it. A sensor mounted upside down has the same heading as an upright
+ * one, so the heading alone cannot tell the two apart.
+ */
+std::expected<Interface::Placement, std::string> Interface::placementOf(
+  const std::string& frame_id, const std::string& in_frame_id,
+  const rclcpp::Time& stamp) const
+{
+  geometry_msgs::msg::TransformStamped placement;
+
+  try
+  {
+    placement = transform_buffer_->lookupTransform(in_frame_id, frame_id, stamp,
+      tf_lookup_timeout_);
+  }
+  catch (const tf2::TransformException& exception)
+  {
+    return std::unexpected(std::format(
+      "the transform tree does not carry \"{}\" against \"{}\" at the "
+      "scan's own stamp within {} s: {}", in_frame_id, frame_id,
+      tf_lookup_timeout_.seconds(), exception.what()));
+  }
+
+  const std::optional<tf2::Matrix3x3> rotation =
+    rotationOf(placement.transform.rotation);
+
+  if (!rotation.has_value())
+  {
+    return std::unexpected(std::format(
+      "the placement of \"{}\" in \"{}\" carries no heading: a quaternion "
+      "must be finite and must have a length to be normalised by", frame_id,
+      in_frame_id));
+  }
+
+  const tf2::Vector3 forward = rotation->getColumn(0);
+
+  return Placement{
+    .pose = Pose{
+      .x = placement.transform.translation.x,
+      .y = placement.transform.translation.y,
+      .t = FSM::Utils::wrapAngle(std::atan2(forward.y(), forward.x()))},
+    .upside_down = rotation->getColumn(2).z() < 0.0};
+}
+
+void Interface::publishHypotheses(const std::vector<Pose>& hypotheses,
+  const rclcpp::Time& stamp)
+{
+  geometry_msgs::msg::PoseArray message;
+  message.header.stamp = stamp;
+  message.header.frame_id = fixed_frame_id_;
+  message.poses.reserve(hypotheses.size());
+
+  for (const Pose& hypothesis : hypotheses)
+    message.poses.push_back(retypePose(hypothesis));
+
+  hypotheses_publisher_->publish(message);
+}
+
+/**
+ * @details The cast carries the scan's own frame, first angle, spacing and ray
+ * count, so that it lies over the scan the sensor reported ray for ray,
+ * whatever the search was reduced onto. Its ray `k` is cast along the
+ * direction the sensor's own ray `k` points in.
+ * `sensor` is the pose the search answered with. For a sensor mounted upside
+ * down that is the pose of the upright sensor its scan was handed over as,
+ * whose ray `n - 1 - k` points where the rolled sensor's ray `k` does, so the
+ * cast is taken in reverse order.
+ * Each ray is cast on its own, along exactly the angle the scan gives it. The
+ * caster lays a cast of one ray half a turn behind the pose it is given, so
+ * each is cast from a pose turned half a turn past the ray's own direction.
+ * One cast over a whole turn at the scan's spacing would lie over the scan
+ * only where a turn holds a whole number of its rays.
+ * @remark The map is handed in rather than read from the node, so that a map
+ * arriving while a run was under way cannot have this cast taken from it. What
+ * is published is a cast from the map the answer was found in.
+ */
+void Interface::publishMapScan(const fsm_localisation::OccupancyGridMap& map,
+  const sensor_msgs::msg::LaserScan& scan, const Pose& sensor,
+  const bool upside_down, const rclcpp::Time& stamp)
+{
+  const std::size_t rays = scan.ranges.size();
+
+  sensor_msgs::msg::LaserScan message;
+  message.header.stamp = stamp;
+  message.header.frame_id = scan.header.frame_id;
+  message.angle_min = scan.angle_min;
+  message.angle_max = scan.angle_max;
+  message.angle_increment = scan.angle_increment;
+  message.range_min = scan.range_min;
+  message.range_max = scan.range_max;
+  message.ranges.reserve(rays);
+
+  for (std::size_t ray = 0; ray < rays; ray++)
+  {
+    const std::size_t upright_ray = upside_down ? rays - 1 - ray : ray;
+    const double heading = sensor.t + scan.angle_min +
+      static_cast<double>(upright_ray) * scan.angle_increment;
+
+    message.ranges.push_back(static_cast<float>(map.ranges(
+      Pose{.x = sensor.x, .y = sensor.y, .t = heading + M_PI}, 1U,
+      scan.range_max).front()));
+  }
+
+  map_scan_publisher_->publish(message);
+}
+
+/**
+ * @details The covariance is not measured and is not an estimate of this
+ * package's own uncertainty. It is what a consumer such as amcl is seeded with,
+ * and it is published as it was configured.
+ */
+void Interface::publishPose(const Pose& robot, const rclcpp::Time& stamp)
+{
+  geometry_msgs::msg::PoseWithCovarianceStamped message;
+  message.header.stamp = stamp;
+  message.header.frame_id = fixed_frame_id_;
+  message.pose.pose = retypePose(robot);
+
+  std::array<double, 36> covariance{};
+  covariance[0] = initial_cov_xx_;
+  covariance[7] = initial_cov_yy_;
+  covariance[35] = initial_cov_aa_;
+  message.pose.covariance = covariance;
+
+  pose_publisher_->publish(message);
+}
+
+void Interface::publishTopHypotheses(const std::vector<ScoredPose>& survivors,
+  const rclcpp::Time& stamp)
+{
+  geometry_msgs::msg::PoseArray message;
+  message.header.stamp = stamp;
+  message.header.frame_id = fixed_frame_id_;
+  message.poses.reserve(survivors.size());
+
+  for (const ScoredPose& survivor : survivors)
+    message.poses.push_back(retypePose(survivor.pose));
+
+  top_hypotheses_publisher_->publish(message);
+}
+
+/**
+ * @details The robot's pose in the global frame composed with the odometry
+ * frame's pose in the robot frame, which is the transform that places the
+ * answer in a tree that already carries an odometry frame.
+ * @remark The odometry placement is read when the run begins and handed in
+ * here, not read again now. A tree keeps a window of history, and a run of a
+ * real building takes long enough to leave the scan's own stamp outside it.
+ */
+void Interface::publishTransform(const Pose& robot, const Pose& odom_in_robot,
+  const rclcpp::Time& stamp)
+{
+  const Pose odom_in_global = compose(robot, odom_in_robot);
+
+  geometry_msgs::msg::TransformStamped message;
+  message.header.stamp = stamp;
+  message.header.frame_id = fixed_frame_id_;
+  message.child_frame_id = odom_frame_id_;
+
+  message.transform.translation.x = odom_in_global.x;
+  message.transform.translation.y = odom_in_global.y;
+  message.transform.translation.z = 0.0;
+
+  tf2::Quaternion quaternion;
+  quaternion.setRPY(0.0, 0.0, odom_in_global.t);
+  quaternion.normalize();
+  message.transform.rotation.x = quaternion.x();
+  message.transform.rotation.y = quaternion.y();
+  message.transform.rotation.z = quaternion.z();
+  message.transform.rotation.w = quaternion.w();
+
+  transform_broadcaster_->sendTransform(message);
+}
+
+/**
+ * @details `rng_seed` is set in both places from the one declared parameter:
+ * the library's own field, which governs the dispersal draw, and the matcher's
+ * embedded field, which governs the recovery jitter. One parameter, two fields,
+ * so that pinning it pins the whole of a run rather than half of it.
+ * @remark The occupancy threshold and the caster's name are read into the
+ * embedded matcher settings, which is where the matcher's own validator judges
+ * them, and are declared under the names the documentation gives them.
+ */
+Parameters Interface::readParameters()
+{
+  Parameters parameters;
+
+  parameters.da = countOf(*this, "da");
+  parameters.dl = get_parameter("dl").as_double();
+  parameters.num_threads = countOf(*this, "num_threads");
+  parameters.rng_seed = countOf(*this, "rng_seed");
+  parameters.top_k_caers = countOf(*this, "top_k_caers");
+
+  parameters.matcher.size_scan = countOf(*this, "size_scan");
+  parameters.matcher.num_iterations = countOf(*this, "num_iterations");
+  parameters.matcher.xy_bound = get_parameter("xy_bound").as_double();
+  parameters.matcher.t_bound = get_parameter("t_bound").as_double();
+  parameters.matcher.max_counter = countOf(*this, "max_counter");
+  parameters.matcher.min_magnification_size =
+    countOf(*this, "min_magnification_size");
+  parameters.matcher.max_magnification_size =
+    countOf(*this, "max_magnification_size");
+  parameters.matcher.max_recoveries = countOf(*this, "max_recoveries");
+  parameters.matcher.rng_seed = parameters.rng_seed;
+  parameters.matcher.ray_search = get_parameter("ray_search").as_string();
+
+  parameters.matcher.enforce_early_gearup =
+    get_parameter("enforce_early_gearup").as_bool();
+  parameters.matcher.enforce_translation_bound =
+    get_parameter("enforce_translation_bound").as_bool();
+  parameters.matcher.recover_on_failed_sift =
+    get_parameter("recover_on_failed_sift").as_bool();
+
+  parameters.matcher.occupancy_threshold =
+    static_cast<int>(get_parameter("occupancy_threshold").as_int());
+  parameters.matcher.map_scan_method =
+    get_parameter("map_scan_method").as_string();
+
+  return parameters;
+}
+
+geometry_msgs::msg::Pose Interface::retypePose(const Pose& pose) const
+{
+  geometry_msgs::msg::Pose message;
+
+  message.position.x = pose.x;
+  message.position.y = pose.y;
+  message.position.z = 0.0;
+
+  tf2::Quaternion quaternion;
+  quaternion.setRPY(0.0, 0.0, pose.t);
+  quaternion.normalize();
+  message.orientation.x = quaternion.x();
+  message.orientation.y = quaternion.y();
+  message.orientation.z = quaternion.z();
+  message.orientation.w = quaternion.w();
+
+  return message;
+}
+
+void Interface::scanCallback(sensor_msgs::msg::LaserScan::ConstSharedPtr scan)
+{
+  const std::lock_guard<std::mutex> lock(held_mutex_);
+  latest_scan_ = std::move(scan);
+}
+
+/**
+ * @details The robot's frame against the frame the scan message itself names.
+ * Nothing has to be told twice what the scan already says, so there is no
+ * parameter for the sensor's frame and there is not to be one.
+ */
+std::expected<Interface::Placement, std::string> Interface::sensorOnRobot(
+  const std::string& sensor_frame_id, const rclcpp::Time& stamp) const
+{
+  const std::expected<Placement, std::string> placement =
+    placementOf(sensor_frame_id, base_frame_id_, stamp);
+
+  if (placement.has_value())
+    return placement;
+
+  return std::unexpected("the sensor's placement on the robot cannot be read, "
+    + sensor_frame_id + " being the frame the scan itself names: "
+    + placement.error());
+}
+
+/**
+ * @details Building the map, walking its free space and constructing the
+ * localiser over both happen here, off the lock, and only the swap of the two
+ * finished objects is taken under it. A run that is already under way holds its
+ * own map and its own localiser and is unaffected by either.
+ * @remark What is refused, and by whom, is not restated here. The map's own
+ * builder judges the message and names the field it refused, and this hands that
+ * sentence back to whichever of the two callers asked, so that a topic can log
+ * it and a start up can die of it.
+ */
+std::string Interface::takeMap(const nav_msgs::msg::OccupancyGrid& map)
+{
+  const std::expected<std::shared_ptr<
+    const fsm_localisation::OccupancyGridMap>, std::string> built =
+    fsm_localisation::OccupancyGridMap::build(map,
+      parameters_.matcher.occupancy_threshold, casting_method_);
+
+  if (!built.has_value())
+    return built.error();
+
+  FreeSpace free_space = freeSpaceOf(**built);
+  const std::size_t free_cells = free_space.cells.size();
+
+  if (free_cells == 0U)
+  {
+    return "the map carries no free cell, so there is nowhere in it to place "
+      "a hypothesis and no request against it could ever be answered";
+  }
+
+  const auto localiser =
+    std::make_shared<const Localiser>(parameters_, *built,
+      std::move(free_space));
+
+  {
+    const std::lock_guard<std::mutex> lock(held_mutex_);
+    map_ = *built;
+    localiser_ = localiser;
+  }
+
+  if (map.header.frame_id != fixed_frame_id_)
+  {
+    RCLCPP_WARN(get_logger(),
+      "This map is labelled \"%s\" and every answer from it will be labelled "
+      "\"%s\", which is what fixed_frame_id says. An answer's coordinates are "
+      "the map's own, so the two names have to mean the same frame.",
+      map.header.frame_id.c_str(), fixed_frame_id_.c_str());
+  }
+
+  RCLCPP_INFO(get_logger(),
+    "Map taken: %u by %u cells at %.3f m, %zu of them free, cast by %s.",
+    map.info.width, map.info.height, map.info.resolution, free_cells,
+    std::string(fsm_localisation::nameOfCastingMethod(casting_method_)).c_str());
+
+  return {};
+}
+
+}

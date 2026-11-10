@@ -1,0 +1,2455 @@
+// Copyright 2026 Alexandros Filotheou
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+/**
+ * @brief `cbgl::Localiser::localise`: a pose recovered from one scan with no
+ * estimate to start from, and every reason this library has for producing no
+ * pose at all.
+ * @details
+ * **The room.** One room, drawn three times: at five centimetre cells, at
+ * twenty centimetre cells, and at five centimetre cells with the origin
+ * translated and turned. The two cell sizes describe the same room exactly, the
+ * wall band and the pillar each being a whole number of cells at either size,
+ * so the only difference between those two cases is the resolution. The room is
+ * a rectangle with a pillar off both of its axes of symmetry, so no half turn
+ * or reflection of the truth sees what the truth sees and a recovered pose
+ * cannot be right by coincidence.
+ * The three grids are read from `test/fixtures`, in the same plain text the
+ * harness's own generator writes, so that what is localised in is data rather
+ * than a room this file draws for itself.
+ * **Two kinds of measurement, and two tolerances.**
+ * A scan cast from the map itself makes the case measure the search: the only
+ * error left is what the search does with a scan that agrees with the map
+ * exactly. The bound is two cells, being one cell for what a map can support at
+ * all, since a ray stops at a cell, and another for the half cell diagonal
+ * between the truth and the centre of the cell the hypothesis was drawn at. The
+ * heading gets the same two cells expressed as an angle, `atan(2 * resolution /
+ * mean_range)`, because a heading wrong by `dt` moves what the sensor would see
+ * at range `r` sideways by `r * dt`.
+ * A scan cast from the room's own polygons is the harder case, and the honest
+ * one: the grid is then the only approximation in the chain. A caster answers
+ * with a distance to a cell rather than to the wall's face, and the ray
+ * marching caster can overshoot a face by up to `sqrt(2)` cells on top of the
+ * cell itself, so the scan and the map disagree by around three cells on a ray
+ * and the pose that best explains the scan can stand about that far from the
+ * truth. The bound is four cells, which is that with a cell to spare, and it is
+ * asserted at the five centimetre grids alone: at twenty centimetre cells four
+ * cells is most of the width of this room, and a bound that loose would pass
+ * on a wrong answer.
+ * **A narrower sensor, reduced and not.** Two cases cast a scan narrower than
+ * a turn at a real sensor's spacing. One reduces it to fewer rays than it
+ * carries, and one matches it at its own count. Their tolerance is a third
+ * one, on the heading alone, set by where the window compares the rays
+ * against where they were taken, and each case sets it out.
+ * **How a scan off its compared angles is read.** Five cases read the
+ * sampling back through the sift's own score, from a reference that casts
+ * only what the case is about. A whole turn is read between its last ray and
+ * its first where it is compared between them, and one from plus pi as one
+ * from minus pi. A ray compared beyond the first ray takes that ray's range
+ * whether the ray beside it was measured or not. A gap in a scan of
+ * `size_scan` rays stays a gap, as it does in one whose rays lie on those
+ * angles, and leaves missing no more compared rays than lie between the
+ * measured rays either side of it.
+ * **Every refusal.** All seven: a map with no free space, an empty hypothesis
+ * set, a scan whose angles no sensor reports, a scan shorter than the matcher
+ * asks for, a scan carrying no usable range, a refinement that refused every
+ * survivor, and a pose the metric cannot grade. A refinement that refused
+ * every survivor is reached by handing in hypotheses that stand inside the
+ * room's own wall, which the matcher refuses one by one for standing off free
+ * space, and the count it reports per reason is asserted rather than merely
+ * the refusal. The ROS 1 build published a pose in that case, read from index
+ * minus one of its own list of candidates.
+ * **The seventh reason, and the reference it takes to reach it.** A run also
+ * refuses where the pose it would have reported cannot be graded by the metric
+ * it is selected by. No occupancy grid can provoke that, for the reason
+ * `AReferenceThatCastsNothingFromAFreePoseYieldsNoAnswer` sets out at length,
+ * and that case reaches it through a reference that is not a grid: a localiser
+ * is constructed with any `FSM::GridReference`, so the guard defends the
+ * boundary of a public interface rather than an impossibility. The nearest an
+ * occupancy grid comes is a map with nothing in range, which the matcher
+ * refuses on its own first cast, and that is
+ * `AMapWithNothingInRangeIsRefusedBeforeAnUnscorablePoseCanWin`.
+ * **The matcher's six refusals, as a run through this library meets them.** A
+ * survivor standing off free space is reached by hypotheses inside the wall, a
+ * first cast that met nothing by a map with nothing standing in it, and a spent
+ * recovery budget by a translation bound smaller than the cell the refinement
+ * has to cross. The remaining three, a scan too short, a scan carrying nothing
+ * usable and an aperture no sensor can cover, cannot reach the matcher through
+ * the node, because the node and this library decide all three before a
+ * hypothesis is drawn. A direct call to this library can still hand the
+ * matcher an aperture above a whole turn. The first two are pinned against the
+ * matcher's own copies of the same two rules by `ScanRefusalSeam` and, from
+ * the other side of the boundary, by
+ * `AScanTheSeamHasNoBusinessRefusingIsRefusedByNeitherLayer`.
+ * **A measurement that carries no information.** A scan reading the sensor's
+ * maximum range on every ray is refused by nothing and answered coherently,
+ * while saying nothing at all about where the sensor was. What the metric ranks
+ * by in that case is how much space a pose can see, which is pinned so that a
+ * later decision to treat it differently is a decision rather than an accident.
+ * **What the density is set to.** Fifteen hypothesis positions per square metre
+ * of free space, which is what the package ships. The room is the same at both
+ * cell sizes and so is its free area, so the same density draws the same number
+ * of hypotheses at either resolution and the two cases differ in the map's
+ * resolution and in nothing else.
+ */
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <fstream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <numeric>
+#include <ranges>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "cbgl/cbgl.hpp"
+#include "fsm_localisation/occupancy_grid_map.hpp"
+
+namespace
+{
+using cbgl::Error;
+using cbgl::FreeSpace;
+using cbgl::Localiser;
+using cbgl::Parameters;
+using cbgl::Point;
+using cbgl::Pose;
+using cbgl::Result;
+using cbgl::ScoredPose;
+using fsm_localisation::CastingMethod;
+using fsm_localisation::CellCoordinates;
+using fsm_localisation::CorrectionError;
+using fsm_localisation::Corrector;
+using fsm_localisation::OccupancyGridMap;
+using fsm_localisation::WorldPoint;
+
+const int kOccupancyThreshold = 65;
+
+const unsigned int kRayCount = 360U;
+const unsigned int kOrientations = 32U;
+const unsigned int kTopK = 10U;
+
+const double kDensity = 15.0;
+
+/**
+ * @brief The maximum range the fixture's scans were cast at, which is what a
+ * ray meeting nothing reports in them.
+ */
+const double kRangeMax = 100.0;
+
+const double kFullTurn = 2.0 * M_PI;
+
+/**
+ * @brief A sensor narrower than a turn: 1073 rays a quarter of a degree
+ * apart, centred on its heading, which puts its first ray at -134 degrees.
+ * @details The geometry of a real robot's sensor this package has been run
+ * against.
+ */
+const unsigned int kSensorRays = 1073U;
+const double kSensorIncrement = 0.25 * M_PI / 180.0;
+
+/**
+ * @brief How many rays that sensor's scan is reduced to: as many as every
+ * fourth of its rays counted from the first, which is 269.
+ */
+const std::size_t kReducedRays = (kSensorRays - 1U) / 4U + 1U;
+
+/**
+ * @brief That sensor less one ray: 1072 rays at the same spacing, centred on
+ * its heading, which puts its first ray at -133.875 degrees, half a ray off
+ * every ray a whole turn cast at that spacing lays.
+ */
+const unsigned int kEvenSensorRays = kSensorRays - 1U;
+
+/**
+ * @brief The scans cast from the room's own polygons, and the poses they were
+ * cast at, expressed in the room's own frame.
+ */
+const char* const kScansFixture = "pillar_room_scans.csv";
+const char* const kTruthFixture = "pillar_room_truth.csv";
+
+/**
+ * @brief One of the grids under `test/fixtures`, by the name a failure message
+ * should call it and the file it is read from.
+ */
+struct GridCase
+{
+  const char* label{""};
+  const char* file{""};
+};
+
+const GridCase kEveryGrid[] = {
+  GridCase{.label = "fine", .file = "pillar_room_grid_fine.csv"},
+  GridCase{.label = "coarse", .file = "pillar_room_grid_coarse.csv"},
+  GridCase{.label = "rotated_origin", .file = "pillar_room_grid_rotated.csv"}};
+
+const GridCase kFineGrids[] = {
+  GridCase{.label = "fine", .file = "pillar_room_grid_fine.csv"},
+  GridCase{.label = "rotated_origin", .file = "pillar_room_grid_rotated.csv"}};
+
+/**
+ * @brief A grid as its fixture carries it: the message to build a map from, and
+ * the yaw of the origin, which the map applies to its own cells but does not
+ * report back.
+ */
+struct GridFixture
+{
+  nav_msgs::msg::OccupancyGrid message;
+  double origin_yaw{0.0};
+};
+
+/**
+ * @brief One scan both this library and the matcher have to refuse, and the
+ * reason each of them has to give for it.
+ * @details `rays` rays, every one of them `range`. The four ways a lidar reports
+ * a ray it could not trust are one case each, since each is a separate encoding
+ * of the same thing and either layer could stop recognising one of them without
+ * the other noticing, and the length boundary is one more.
+ */
+struct SeamCase
+{
+  const char* label{""};
+  double range{0.0};
+  std::size_t rays{0};
+  Error::Reason library{Error::Reason::scan_entirely_invalid};
+  CorrectionError matcher{CorrectionError::scan_entirely_invalid};
+};
+
+const SeamCase kSeamCases[] = {
+  SeamCase{.label = "every_ray_zero", .range = 0.0, .rays = kRayCount,
+    .library = Error::Reason::scan_entirely_invalid,
+    .matcher = CorrectionError::scan_entirely_invalid},
+  SeamCase{.label = "every_ray_infinite",
+    .range = std::numeric_limits<double>::infinity(), .rays = kRayCount,
+    .library = Error::Reason::scan_entirely_invalid,
+    .matcher = CorrectionError::scan_entirely_invalid},
+  SeamCase{.label = "every_ray_not_a_number",
+    .range = std::numeric_limits<double>::quiet_NaN(), .rays = kRayCount,
+    .library = Error::Reason::scan_entirely_invalid,
+    .matcher = CorrectionError::scan_entirely_invalid},
+  SeamCase{.label = "every_ray_negative", .range = -1.0, .rays = kRayCount,
+    .library = Error::Reason::scan_entirely_invalid,
+    .matcher = CorrectionError::scan_entirely_invalid},
+  SeamCase{.label = "one_ray_short_of_the_size_asked_for", .range = 1.0,
+    .rays = kRayCount - 1U,
+    .library = Error::Reason::scan_too_short,
+    .matcher = CorrectionError::scan_too_short}};
+
+/**
+ * @brief A reference that calls every position free and casts every ray at
+ * zero.
+ * @details Zero on every ray is what a caster really reports for a sensor
+ * standing inside an obstacle: the distance to blocked space is nothing, so the
+ * ray stops where it started. What no occupancy grid can also do is call that
+ * position free, and that is the whole of the contradiction this stands for. It
+ * is a reference rather than a map, which the interface a localiser is
+ * constructed with allows, and it exists so that the one refusal an occupancy
+ * grid cannot provoke is provoked by something.
+ * @remark `max_range` is deliberately ignored. A cast of zeros is not a cast
+ * that met nothing at the far end of its reach; it is a cast that met something
+ * at no distance at all, which is the case the metric cannot grade because no
+ * ray of it is greater than zero.
+ */
+class FreeEverywhereCastingNothing : public FSM::GridReference
+{
+public:
+  bool isFree(const double, const double) const noexcept override
+  {
+    return true;
+  }
+
+  std::vector<double> ranges(const FSM::Pose&, const unsigned int num_rays,
+    const double) const override
+  {
+    return std::vector<double>(num_rays, 0.0);
+  }
+};
+
+/**
+ * @brief A reference that calls every position free and casts the ranges it
+ * was built with, from whatever pose it is cast from.
+ * @details The sift scores a pose by the difference between the scan and the
+ * cast, summed over the rays where both are greater than zero. A cast of
+ * nought on every ray but those a case is about therefore makes the score a
+ * reading of those rays of the scan, as the sift compared them, and of
+ * nothing else.
+ * @remark `num_rays` and `max_range` are ignored. A case builds the cast at
+ * the ray count the window casts its own scan at.
+ */
+class FreeEverywhereCastingThese : public FSM::GridReference
+{
+public:
+  explicit FreeEverywhereCastingThese(std::vector<double> cast)
+  : cast_(std::move(cast))
+  {
+  }
+
+  bool isFree(const double, const double) const noexcept override
+  {
+    return true;
+  }
+
+  std::vector<double> ranges(const FSM::Pose&, const unsigned int,
+    const double) const override
+  {
+    return cast_;
+  }
+
+private:
+  const std::vector<double> cast_;
+};
+
+class LocaliserOnAFineGrid : public testing::TestWithParam<GridCase>
+{
+};
+
+class LocaliserOnEveryGrid : public testing::TestWithParam<GridCase>
+{
+};
+
+class ScanRefusalSeam : public testing::TestWithParam<SeamCase>
+{
+};
+
+std::string fixturePath(const std::string& name)
+{
+  return std::string(CBGL_TEST_FIXTURES) + "/" + name;
+}
+
+FreeSpace freeSpaceOfMap(const OccupancyGridMap& map)
+{
+  FreeSpace free_space;
+  free_space.resolution = map.resolution();
+
+  for (unsigned int column = 0U; column < map.width(); column++)
+    for (unsigned int row = 0U; row < map.height(); row++)
+    {
+      const WorldPoint centre = map.worldFromCell(CellCoordinates{
+        .column = column + 0.5, .row = row + 0.5});
+
+      if (map.isFree(centre.x, centre.y))
+        free_space.cells.push_back(Point{.x = centre.x, .y = centre.y});
+    }
+
+  return free_space;
+}
+
+std::string gridCaseSuffix(const testing::TestParamInfo<GridCase>& info)
+{
+  return info.param.label;
+}
+
+/**
+ * @brief The bound on a heading, being a bound of `cells` cells seen at the
+ * ranges the scan under test actually carries.
+ */
+double headingBound(const std::vector<double>& scan, const double resolution,
+  const double cells)
+{
+  const double mean =
+    std::accumulate(scan.begin(), scan.end(), 0.0) / scan.size();
+
+  return std::atan(cells * resolution / mean);
+}
+
+/**
+ * @brief How far apart two headings are, wrapped onto the half open turn so
+ * that a heading just under pi and one just over minus pi are the small
+ * difference apart they really are rather than a whole turn.
+ */
+double headingError(const double first, const double second)
+{
+  return std::abs(fmod(first - second + 5*M_PI, 2*M_PI) - M_PI);
+}
+
+std::shared_ptr<const OccupancyGridMap> mapOf(const GridFixture& fixture)
+{
+  const auto built = OccupancyGridMap::build(
+    fixture.message, kOccupancyThreshold, CastingMethod::ray_marching);
+
+  return built.has_value() ? built.value() : nullptr;
+}
+
+Parameters parametersOf(const unsigned int top_k_caers)
+{
+  Parameters parameters;
+  parameters.dl = kDensity;
+  parameters.da = kOrientations;
+  parameters.top_k_caers = top_k_caers;
+  parameters.num_threads = 0U;
+  parameters.rng_seed = 20260818U;
+
+  parameters.matcher.size_scan = kRayCount;
+  parameters.matcher.rng_seed = 20260818U;
+  parameters.matcher.num_iterations = 3U;
+  parameters.matcher.xy_bound = 1.2;
+  parameters.matcher.t_bound = 0.786;
+  parameters.matcher.max_recoveries = 10U;
+  parameters.matcher.enforce_early_gearup = true;
+  parameters.matcher.enforce_translation_bound = true;
+  parameters.matcher.recover_on_failed_sift = true;
+  parameters.matcher.occupancy_threshold = kOccupancyThreshold;
+
+  return parameters;
+}
+
+/**
+ * @brief `rays` readings of `range` but for a run of `gap_rays` from ray
+ * `gap_begin` that the sensor did not measure.
+ */
+std::vector<double> rangesWithAGap(const std::size_t rays,
+  const double range, const std::size_t gap_begin,
+  const std::size_t gap_rays)
+{
+  std::vector<double> ranges(rays, range);
+  std::fill_n(ranges.begin() + gap_begin, gap_rays,
+    std::numeric_limits<double>::quiet_NaN());
+
+  return ranges;
+}
+
+GridFixture readGrid(const std::string& name)
+{
+  std::ifstream file(fixturePath(name));
+  EXPECT_TRUE(file.good()) << "cannot open " << fixturePath(name);
+
+  unsigned int width = 0U;
+  unsigned int height = 0U;
+  double resolution = 0.0;
+  double origin_x = 0.0;
+  double origin_y = 0.0;
+  double origin_yaw = 0.0;
+
+  file >> width >> height >> resolution >> origin_x >> origin_y >> origin_yaw;
+
+  GridFixture fixture;
+  fixture.origin_yaw = origin_yaw;
+
+  fixture.message.info.width = width;
+  fixture.message.info.height = height;
+  fixture.message.info.resolution = static_cast<float>(resolution);
+  fixture.message.info.origin.position.x = origin_x;
+  fixture.message.info.origin.position.y = origin_y;
+  fixture.message.info.origin.orientation.z = std::sin(origin_yaw / 2.0);
+  fixture.message.info.origin.orientation.w = std::cos(origin_yaw / 2.0);
+
+  fixture.message.data.resize(
+    static_cast<std::size_t>(width) * height);
+
+  for (std::size_t i = 0; i < fixture.message.data.size(); i++)
+  {
+    int value = 0;
+    file >> value;
+    fixture.message.data[i] = static_cast<std::int8_t>(value);
+  }
+
+  return fixture;
+}
+
+std::vector<std::vector<double>> readScans(const std::string& name)
+{
+  std::ifstream file(fixturePath(name));
+  EXPECT_TRUE(file.good()) << "cannot open " << fixturePath(name);
+
+  std::size_t count = 0;
+  std::size_t size = 0;
+  file >> count >> size;
+
+  std::vector<std::vector<double>> scans(count, std::vector<double>(size));
+
+  for (std::size_t s = 0; s < count; s++)
+    for (std::size_t i = 0; i < size; i++)
+      file >> scans[s][i];
+
+  return scans;
+}
+
+/**
+ * @brief The truth poses, in the room's own frame. Every grid places the same
+ * room, so a pose of the room is placed in each grid's world by that grid's own
+ * origin.
+ */
+std::vector<Pose> readTruth(const std::string& name)
+{
+  std::ifstream file(fixturePath(name));
+  EXPECT_TRUE(file.good()) << "cannot open " << fixturePath(name);
+
+  std::vector<Pose> poses;
+
+  std::string line;
+  std::getline(file, line);
+
+  while (std::getline(file, line))
+  {
+    if (line.empty())
+      continue;
+
+    std::replace(line.begin(), line.end(), ',', ' ');
+    std::istringstream values(line);
+
+    unsigned int index = 0U;
+    Pose pose;
+    values >> index >> pose.x >> pose.y >> pose.t;
+
+    poses.push_back(pose);
+  }
+
+  return poses;
+}
+
+std::string seamCaseSuffix(const testing::TestParamInfo<SeamCase>& info)
+{
+  return info.param.label;
+}
+
+/**
+ * @brief What the sift makes of `measured`, a scan over `aperture` from
+ * `angle_min`, from one pose that casts `cast`.
+ * @details One orientation and no refinement, so the one survivor is the pose
+ * itself and its score is the metric between `cast` and the scan as the sift
+ * compared it. `size_scan` is nought, so the scan is compared at its own ray
+ * count.
+ */
+std::expected<Result, Error> siftedFromOnePose(
+  const std::vector<double>& measured, std::vector<double> cast,
+  const double aperture, const double angle_min)
+{
+  Parameters parameters = parametersOf(1U);
+  parameters.da = 1U;
+  parameters.refine = false;
+  parameters.matcher.size_scan = 0U;
+
+  const Pose standing{.x = 1.0, .y = 2.0, .t = 0.3};
+
+  FreeSpace free_space;
+  free_space.resolution = 0.05;
+  free_space.cells.push_back(Point{.x = standing.x, .y = standing.y});
+
+  const Localiser localiser(parameters,
+    std::make_shared<const FreeEverywhereCastingThese>(std::move(cast)),
+    free_space);
+
+  const std::vector<Pose> hypotheses{standing};
+
+  return localiser.localise(measured, kRangeMax, hypotheses, aperture,
+    angle_min);
+}
+
+/**
+ * @brief How much range a cast carries in total, which is the only thing a
+ * measurement entirely at its maximum range can rank a candidate by.
+ */
+double totalOf(const std::vector<double>& ranges)
+{
+  return std::accumulate(ranges.begin(), ranges.end(), 0.0);
+}
+
+/**
+ * @brief The same grid, with every one of its cells free.
+ * @details A map that describes free space and nothing standing in it. The
+ * geometry and the origin stay the fixture's own, so what changes between this
+ * and the room it came from is the presence of anything to cast at.
+ */
+GridFixture withNoObstacleAtAll(GridFixture fixture)
+{
+  std::ranges::fill(fixture.message.data, 0);
+  return fixture;
+}
+
+/**
+ * @brief A pose of the room, placed in the world the grid's origin is given in.
+ * @details The position goes through the map's own cell arithmetic rather than
+ * through a second copy of the origin's translation and rotation, a metre of the
+ * room being a whole number of cells of either grid. The heading is the room's
+ * heading turned by the origin's own yaw, which the map applies to its cells but
+ * does not report.
+ */
+Pose worldFromRoom(const OccupancyGridMap& map, const double origin_yaw,
+  const Pose& room)
+{
+  const WorldPoint point = map.worldFromCell(CellCoordinates{
+    .column = room.x / map.resolution(), .row = room.y / map.resolution()});
+
+  return Pose{
+    .x = point.x,
+    .y = point.y,
+    .t = fmod(room.t + origin_yaw + 5*M_PI, 2*M_PI) - M_PI};
+}
+
+}
+
+/**
+ * @brief A gap in a scan of `size_scan` rays is skipped by the sift whether
+ * the scan's rays lie on the angles they are compared at or off them.
+ * @details
+ * **The scene.** `kRayCount` rays over a whole turn, every one reading 2 m but
+ * a run of forty that the sensor did not measure. The pose casts 1 m along
+ * every ray, so every ray the metric counts adds exactly a metre, and the
+ * sift's score is the number of rays it compared.
+ * **The two scans.** The same ranges twice. From -180 degrees every ray lies
+ * where the window compares it, and the scan reaches the sift as the sensor
+ * gave it. From -179.5 every ray lies half a ray off, and the scan is read at
+ * the angles it is compared at, each compared ray between two of the
+ * sensor's.
+ * **The bound.** The scan on its angles counts 320 rays, the gap skipped.
+ * The other is compared at the sensor's own spacing, and a compared ray of it
+ * beside the gap reads one ray of the gap, so its gap may grow by one ray and
+ * no more: it counts 319 or 320.
+ * **Both regimes, measured.** With the gap filled before the scan is read at
+ * its compared angles, the scan off them counts 360. Left a gap, it counts
+ * 319.
+ */
+TEST(Localiser, AGapInAFullLengthScanOffItsComparedAnglesStaysAGap)
+{
+  const double increment = kFullTurn / kRayCount;
+
+  const std::size_t gap_begin = 100U;
+  const std::size_t gap_rays = 40U;
+
+  const std::vector<double> measured =
+    rangesWithAGap(kRayCount, 2.0, gap_begin, gap_rays);
+
+  const std::vector<double> cast(kRayCount, 1.0);
+
+  const std::expected<Result, Error> on =
+    siftedFromOnePose(measured, cast, kFullTurn, -M_PI);
+  const std::expected<Result, Error> off =
+    siftedFromOnePose(measured, cast, kFullTurn, -M_PI + 0.5 * increment);
+
+  ASSERT_TRUE(on.has_value());
+  ASSERT_TRUE(off.has_value());
+  ASSERT_EQ(on->survivors.size(), 1U);
+  ASSERT_EQ(off->survivors.size(), 1U);
+
+  const double on_count = on->survivors.front().score;
+  const double off_count = off->survivors.front().score;
+
+  ASSERT_EQ(on_count, static_cast<double>(kRayCount - gap_rays))
+    << "the scan whose rays lie on their compared angles reaches the sift as "
+    << "the sensor gave it, so the sift skips its " << gap_rays << " missing "
+    << "rays and compares the rest. Without that this case holds the other "
+    << "scan against nothing.";
+
+  EXPECT_LE(off_count, on_count)
+    << "the scan half a ray off its compared angles was sifted over "
+    << off_count << " rays, where the same ranges on those angles were sifted "
+    << "over " << on_count << ". Its gap of " << gap_rays << " rays was "
+    << "filled before it was read, so the sift compared ranges the sensor "
+    << "never measured.";
+  EXPECT_GE(off_count, on_count - 1.0)
+    << "the scan half a ray off its compared angles was sifted over "
+    << off_count << " rays, where the same ranges on those angles were sifted "
+    << "over " << on_count << ". At the sensor's own spacing a compared ray "
+    << "beside the gap reads one ray of it, so the gap grows by one ray at "
+    << "most.";
+}
+
+/**
+ * @brief A gap in a scan a whole number of rays off its compared angles
+ * leaves missing its own rays and no more.
+ * @details
+ * **The scene.** `kRayCount` rays a degree apart over a whole turn from five
+ * rays past -180 degrees, every one reading 2 m but a run of forty that the
+ * sensor did not measure. Every compared ray lies on a sensor's ray, five
+ * along. The pose casts 1 m along every ray, so the sift's score is the
+ * number of rays it compared. The gap starts at every ray from 1 to 319, so
+ * that the rays either side of it are measured.
+ * **Where they are compared.** Computed in doubles, a compared ray meant to
+ * lie on a sensor's ray carries a rounding residue of either sign. The one on
+ * ray 99 lies at 99.00000000000001, the one on ray 136 at 135.99999999999997
+ * and the one on ray 140 at 140 exactly. A residue towards a missing
+ * neighbour reads that neighbour too.
+ * **The bound.** Every compared ray lies on a sensor's ray, so a gap leaves
+ * missing its own forty rays, inside the `ceil((m + 1) * r)`, 41, that the
+ * sampling allows a gap of `m` rays at `r` of 1.
+ * **Both regimes, measured.** Read with the residue, 205 of the 319 gaps
+ * leave 40 rays missing, 103 leave 41 and 11 leave 42. Read with a compared
+ * ray that lies within the slack of a sensor's ray taken as on it, every gap
+ * leaves 40.
+ */
+TEST(Localiser, AGapInAScanTurnedByWholeRaysLeavesOnlyItsOwnRaysMissing)
+{
+  const double increment = kFullTurn / kRayCount;
+  const double angle_min = -M_PI + 5.0 * increment;
+  const std::size_t gap_rays = 40U;
+
+  const std::vector<double> cast(kRayCount, 1.0);
+
+  std::vector<double> missing;
+  for (std::size_t gap_begin = 1U; gap_begin + gap_rays < kRayCount;
+       gap_begin++)
+  {
+    const std::vector<double> measured =
+      rangesWithAGap(kRayCount, 2.0, gap_begin, gap_rays);
+
+    const std::expected<Result, Error> result =
+      siftedFromOnePose(measured, cast, kFullTurn, angle_min);
+
+    ASSERT_TRUE(result.has_value())
+      << kRayCount << " rays with a gap of " << gap_rays << " from ray "
+      << gap_begin << " were refused, so no compared ray was counted.";
+
+    missing.push_back(static_cast<double>(kRayCount) -
+      result.value().survivors.front().score);
+  }
+
+  const double most = std::ranges::max(missing);
+  const auto beyond = std::ranges::count_if(missing,
+    [gap_rays](const double count) { return count > gap_rays; });
+
+  EXPECT_EQ(most, static_cast<double>(gap_rays))
+    << "a gap of " << gap_rays << " rays left as many as " << most
+    << " compared rays missing, more than its own at " << beyond << " of "
+    << missing.size() << " gap starts. Every compared ray lies on a sensor's "
+    << "ray, so only those on the gap read missing.";
+}
+
+/**
+ * @brief A gap in a scan of `size_scan` rays leaves missing no more compared
+ * rays than lie strictly between the measured rays either side of it.
+ * @details
+ * **The scene.** Two sensors, each reading 2 m on every ray but a run of
+ * forty from ray 100 that it did not measure: `kRayCount` rays a degree apart
+ * over a whole turn, and 500 rays `2 * pi / 999.6` apart over a little more
+ * than half of one. The pose casts 1 m along every ray, so the sift's score
+ * is the number of rays it compared, and the rest are the rays left missing.
+ * Each is sifted from a thousand first angles across one of its rays, from
+ * half its span behind the heading on.
+ * **Where they are compared.** The window lays a whole number of rays round a
+ * turn: 360 at the first sensor's own spacing, and 1000 for the second, which
+ * it therefore compares `2 * pi / 1000` apart. The sensor's spacing over the
+ * compared spacing, `r`, is 1 for the first and 1000 / 999.6, 1.0004, for the
+ * second.
+ * **The bound.** A compared ray is missing where it lies on a missing reading
+ * or between one and its neighbour, so where it lies strictly between the
+ * measured rays either side of the gap, 41 of the sensor's spacings apart. At
+ * most `ceil(41 * r)` compared rays lie there: 41 for the first sensor, one
+ * more than the gap, and 42 for the second.
+ * **Both regimes, measured.** Held to 41, the first sensor passes at every
+ * first angle and the second fails at 16 of the thousand, where it leaves 42
+ * compared rays missing. Held to `ceil(41 * r)`, both pass.
+ */
+TEST(Localiser, AGapLeavesMissingOnlyTheComparedRaysBetweenItsNeighbours)
+{
+  const std::size_t gap_begin = 100U;
+  const std::size_t gap_rays = 40U;
+  const std::size_t first_angles = 1000U;
+
+  const auto expectTheBound = [&](const std::size_t rays, const double turn)
+  {
+    const double increment = kFullTurn / turn;
+    const double aperture = static_cast<double>(rays) * increment;
+
+    const std::vector<double> measured =
+      rangesWithAGap(rays, 2.0, gap_begin, gap_rays);
+    const std::vector<double> cast(FSM::panoramicRaysOf(rays, aperture), 1.0);
+
+    std::vector<double> missing;
+    for (std::size_t k = 0U; k < first_angles; k++)
+    {
+      const double angle_min = -0.5 * aperture + increment *
+        static_cast<double>(k) / static_cast<double>(first_angles);
+
+      const std::expected<Result, Error> result =
+        siftedFromOnePose(measured, cast, aperture, angle_min);
+
+      ASSERT_TRUE(result.has_value())
+        << rays << " rays with a gap of " << gap_rays << " from first angle "
+        << angle_min << " were refused, so no compared ray was counted.";
+
+      missing.push_back(static_cast<double>(rays) -
+        result.value().survivors.front().score);
+    }
+
+    const double ratio = std::round(turn) / turn;
+    const double bound =
+      std::ceil(static_cast<double>(gap_rays + 1U) * ratio);
+
+    const double most = std::ranges::max(missing);
+    const auto beyond = std::ranges::count_if(missing,
+      [bound](const double count) { return count > bound; });
+
+    EXPECT_LE(most, bound)
+      << rays << " rays, " << turn << " to the turn, with a gap of "
+      << gap_rays << " left as many as " << most << " compared rays missing, "
+      << "more than " << bound << " at " << beyond << " of " << first_angles
+      << " first angles. The measured rays either side of the gap are "
+      << gap_rays + 1U << " of the sensor's spacings apart, and at "
+      << ratio << " of the sensor's spacing over the compared spacing at "
+      << "most " << bound << " compared rays lie between them.";
+  };
+
+  expectTheBound(kRayCount, kRayCount);
+  expectTheBound(500U, 999.6);
+}
+
+TEST(Localiser, AHypothesisSetHandedInIsTheSetTheSearchUses)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_fine.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no first pose to read and nothing for this case to localise towards.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+  ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+  const std::vector<double> measured = map->ranges(truth, kRayCount, kRangeMax);
+  const std::vector<Pose> hypotheses{truth};
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, hypotheses, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(result.has_value())
+    << "the one hypothesis handed in is the pose the measurement was cast at, "
+    << "so the search cannot fail to answer from it.";
+
+  EXPECT_EQ(result->num_candidates, hypotheses.size() * kOrientations)
+    << "one hypothesis at " << kOrientations << " orientations is "
+    << kOrientations << " candidates, and no hypothesis of the localiser's own "
+    << "drawing may be added to a set the caller handed in. Handing the set in "
+    << "is what lets two builds be compared over one draw, and a search that "
+    << "quietly dispersed as well would be comparing two different sets.";
+
+  EXPECT_NEAR(result->pose.x, truth.x, 2.0 * map->resolution());
+  EXPECT_NEAR(result->pose.y, truth.y, 2.0 * map->resolution());
+}
+
+TEST(Localiser, AMapWithNoFreeSpaceIsRefused)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  FreeSpace nowhere;
+  nowhere.resolution = map->resolution();
+
+  const Localiser localiser(parametersOf(kTopK), map, nowhere);
+
+  const std::vector<double> measured(kRayCount, 1.0);
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "a map with no free cell offers nowhere for the sensor to have been, so "
+    << "there is no hypothesis to draw and no pose to report. Answering anyway "
+    << "would put the sensor somewhere the map never called free.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::map_has_no_free_space);
+
+  EXPECT_TRUE(result.error().refusals.empty())
+    << "the refusal counts belong to the refinement, which never ran here, so "
+    << "reporting one would name a matcher that was never asked.";
+}
+
+/**
+ * @brief The nearest a run comes to a winner whose own cast met nothing, and
+ * the check that stops it.
+ * @details A pose is unscorable when a fresh cast from it meets nothing at all,
+ * and a map with nothing standing in it is where every pose is unscorable. The
+ * matcher refuses such a survivor before it can ever be corrected, on its own
+ * first cast, so the run ends by naming the refinement rather than by naming
+ * the selection. The case asserts that boundary in both directions: that a cast
+ * from inside this map really does score infinity, and that the run still
+ * refuses for the reason the refinement gives rather than reporting a pose
+ * nobody could grade.
+ */
+TEST(Localiser, AMapWithNothingInRangeIsRefusedBeforeAnUnscorablePoseCanWin)
+{
+  const GridFixture fixture =
+    withNoObstacleAtAll(readGrid("pillar_room_grid_coarse.csv"));
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const FreeSpace free_space = freeSpaceOfMap(*map);
+
+  ASSERT_EQ(free_space.cells.size(),
+    static_cast<std::size_t>(map->width()) * map->height())
+    << "every cell of this map was made free, so its free space is the whole "
+    << "grid and the run cannot be refused for want of somewhere to stand.";
+
+  const WorldPoint middle = map->worldFromCell(CellCoordinates{
+    .column = map->width() / 2U + 0.5, .row = map->height() / 2U + 0.5});
+
+  const Pose standing{.x = middle.x, .y = middle.y, .t = 0.3};
+
+  const std::vector<double> measured(kRayCount, 1.5);
+
+  ASSERT_TRUE(std::isinf(cbgl::caer(measured,
+      map->ranges(standing, kRayCount, kRangeMax), kRangeMax)))
+    << "a cast from the middle of a map with nothing in it must meet nothing "
+    << "on every ray and therefore score infinity. Without that this case is "
+    << "not about an unscorable pose at all.";
+
+  const Localiser localiser(parametersOf(kTopK), map, free_space);
+
+  const std::vector<Pose> hypotheses{standing};
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, hypotheses, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "every pose on this map is unscorable, since no ray from any of them "
+    << "meets anything, so there is no pose the run is entitled to report.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::every_survivor_refused)
+    << "the matcher refuses a survivor whose own first cast met nothing, so "
+    << "the survivor never reaches the selection and the run is refused for "
+    << "the refinement's reason rather than for the selection's. A run that "
+    << "reported no scorable pose here would be naming the later of two checks "
+    << "when the earlier one fired.";
+
+  EXPECT_EQ(
+    result.error().refusals.count(CorrectionError::first_cast_entirely_at_max_range),
+    1u)
+    << "the refusal counted must be the matcher's first cast check, so that a "
+    << "host can say the map had nothing in range rather than merely that the "
+    << "refinement failed.";
+}
+
+/**
+ * @brief A measurement carrying nothing but its own maximum range is answered,
+ * and what the answer is ranked by is how much space a pose can see.
+ * @details
+ * A scan every ray of which reads the sensor's maximum range is a scan that met
+ * nothing at all. Nothing refuses it: the maximum range is a valid reading per
+ * `fsm_localisation::isValidRange`, so the scan is neither unusable nor short,
+ * and a cast taken inside a bounded room is never entirely at that maximum
+ * either, so the metric grades every candidate rather than ranking it behind
+ * everything that scored.
+ * What the metric then computes, ray by ray, is `range_max - cast_i`, since a
+ * cast inside the room is shorter than the maximum everywhere. Summed, that is
+ * `n * range_max - sum(cast_i)`. The measurement enters the expression only
+ * through its own maximum, which every candidate shares, so the ranking is by
+ * the total of the cast and by nothing else: the position that sees the most
+ * space wins, wherever the sensor actually stood. Rotating a cast does not
+ * change its total, so all `da` orientations of that position tie, and the
+ * survivors are `top_k_caers` of them chosen by nothing.
+ * The run is therefore answered, coherently, from a measurement that says
+ * nothing whatever about where the sensor was. That is not a defect: no
+ * requirement asks this library to notice a measurement carrying no
+ * information, and the pose it reports does stand on free space of the map. It
+ * is pinned here so that a later decision to refuse such a run, or to report it
+ * as anything other than an ordinary answer, is a decision somebody made rather
+ * than a change nobody noticed.
+ * @remark The hypothesis set is handed in as every free cell of the map rather
+ * than drawn, so that the cell the ranking has to pick is a cell the search was
+ * certainly offered, and so that the winner can be computed here from the casts
+ * themselves.
+ */
+TEST(Localiser, AMeasurementEntirelyAtItsMaximumRangeIsRankedByTheSpaceSeen)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const FreeSpace free_space = freeSpaceOfMap(*map);
+  ASSERT_FALSE(free_space.cells.empty());
+
+  const std::vector<double> measured(kRayCount, kRangeMax);
+
+  ASSERT_TRUE(std::ranges::all_of(measured, fsm_localisation::isValidRange))
+    << "every ray of this measurement reads the maximum range, which is a "
+    << "usable reading rather than one of the three ways a lidar reports a ray "
+    << "it could not trust. Without that the case would be about an unusable "
+    << "scan and not about an uninformative one.";
+
+  std::vector<Pose> hypotheses;
+  for (const Point& cell : free_space.cells)
+    hypotheses.push_back(Pose{.x = cell.x, .y = cell.y, .t = 0.0});
+
+  const double tolerance =
+    1024.0 * std::numeric_limits<double>::epsilon() * kRayCount * kRangeMax;
+
+  Pose best_seen{};
+  double most_space = -1.0;
+  double next_most_space = -1.0;
+
+  for (const Pose& hypothesis : hypotheses)
+  {
+    const std::vector<double> cast =
+      map->ranges(hypothesis, kRayCount, kRangeMax);
+
+    ASSERT_TRUE(std::ranges::all_of(cast, [](const double range)
+        { return range > 0.0 && range < kRangeMax; }))
+      << "a cast from the free cell at (" << hypothesis.x << ", "
+      << hypothesis.y << ") carries a ray at nothing or a ray at the maximum "
+      << "range, so the score below is not the sum of range_max - cast_i that "
+      << "this case computes it as.";
+
+    const double space = totalOf(cast);
+
+    if (space > most_space)
+    {
+      next_most_space = most_space;
+      most_space = space;
+      best_seen = hypothesis;
+    }
+    else if (space > next_most_space)
+      next_most_space = space;
+  }
+
+  ASSERT_GT(most_space - next_most_space, tolerance)
+    << "two free cells of this map see the same total to within " << tolerance
+    << " metres summed over " << kRayCount << " rays, so which of them a "
+    << "ranking by that total prefers is a coin toss and this case has no "
+    << "single cell to hold the survivors to.";
+
+  const Localiser localiser(parametersOf(kTopK), map, free_space);
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, hypotheses, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(result.has_value())
+    << "a measurement entirely at its own maximum range is answered today, "
+    << "rather than refused. If that has deliberately changed, this case is "
+    << "what has to be rewritten to say so.";
+
+  EXPECT_TRUE(map->isFree(result->pose.x, result->pose.y))
+    << "the answer stands at (" << result->pose.x << ", " << result->pose.y
+    << "), which this map does not call free. An uninformative answer is still "
+    << "expected to be a coherent one.";
+
+  ASSERT_EQ(result->survivors.size(), kTopK);
+
+  for (std::size_t s = 0; s < result->survivors.size(); s++)
+  {
+    const ScoredPose& survivor = result->survivors[s];
+
+    EXPECT_EQ(survivor.pose.x, best_seen.x)
+      << "survivor " << s << " stands at (" << survivor.pose.x << ", "
+      << survivor.pose.y << ") where the free cell that sees the most space is "
+      << "(" << best_seen.x << ", " << best_seen.y << "), which sees "
+      << most_space << " metres of range against " << next_most_space
+      << " for the next best. A measurement entirely at the maximum range "
+      << "scores a candidate by the total of its cast alone, so every survivor "
+      << "has to stand at that one cell.";
+    EXPECT_EQ(survivor.pose.y, best_seen.y);
+
+    const std::vector<double> cast =
+      map->ranges(survivor.pose, kRayCount, kRangeMax);
+
+    const double closed_form = kRayCount * kRangeMax - totalOf(cast);
+
+    EXPECT_NEAR(survivor.score, closed_form, tolerance)
+      << "survivor " << s << " scored " << survivor.score << " where summing "
+      << "range_max - cast_i over the " << kRayCount << " rays of a fresh cast "
+      << "at the same pose gives " << closed_form << ". The measurement is the "
+      << "maximum range on every ray, so the two are the same sum in two "
+      << "orderings and may differ only by the rounding of that.";
+
+    EXPECT_NEAR(survivor.score, result->survivors.front().score, tolerance)
+      << "survivor " << s << " scored " << survivor.score << " and the first "
+      << "survivor scored " << result->survivors.front().score << ". The "
+      << kTopK << " survivors are " << kTopK << " orientations of one position, "
+      << "and rotating a cast does not change its total, so the sift cannot "
+      << "prefer any of them to any other. That the answer is one of them is "
+      << "arbitrary, and that is the whole of what this case records.";
+  }
+}
+
+/**
+ * @brief An empty hypothesis set is refused for being empty.
+ * @details The five argument entry point exists so a caller can hand in a
+ * hypothesis set of its own, and an empty one is the caller's doing rather than
+ * the map's. Reporting it as a map with no free space is a false sentence about
+ * a map with thousands of free cells, and it sends whoever reads the log to
+ * look at the map instead of at the set they handed in. The same map and the
+ * same scan are localised again from a set of one, so the refusal is shown to
+ * be about the set rather than about anything else in the run.
+ */
+TEST(Localiser, AnEmptyHypothesisSetIsRefusedForBeingEmpty)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no first pose to read and nothing for this case to localise towards.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+  ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+  const std::vector<double> measured = map->ranges(truth, kRayCount, kRangeMax);
+
+  const FreeSpace free_space = freeSpaceOfMap(*map);
+  ASSERT_FALSE(free_space.cells.empty())
+    << "this case needs a healthy map, or a refusal naming the map would be "
+    << "the truth rather than the lie it exists to keep out.";
+
+  const Localiser localiser(parametersOf(kTopK), map, free_space);
+
+  const std::vector<Pose> none;
+
+  const std::expected<Result, Error> refused =
+    localiser.localise(measured, kRangeMax, none, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(refused.has_value())
+    << "there is no hypothesis to score, so there is nothing to rank, nothing "
+    << "to refine and no pose to report.";
+
+  EXPECT_EQ(refused.error().reason, Error::Reason::no_hypotheses_given)
+    << "the map offers " << free_space.cells.size() << " free cells, so a "
+    << "refusal that named the map as having none would be a false sentence "
+    << "about a healthy map. What was empty is the set the caller handed in.";
+
+  const std::vector<Pose> one{truth};
+
+  EXPECT_TRUE(
+    localiser.localise(measured, kRangeMax, one, kFullTurn, -M_PI).has_value())
+    << "the same localiser, the same map and the same scan answer from a set "
+    << "of one pose, so the refusal above is about the set being empty and "
+    << "about nothing else in the run.";
+}
+
+/**
+ * @brief A ray compared beyond the sensor's first ray takes the first ray's
+ * range, whether the ray beside it was measured or not.
+ * @details
+ * **The scene.** The sensor of `kEvenSensorRays` rays `kSensorIncrement`
+ * apart, centred, so its first ray lies at -133.875 degrees. The window
+ * compares ray 0 at -134.000, beyond that first ray, so ray 0 is given the
+ * first ray's range and lies on it, the ray beside it carrying no weight. The
+ * sensor did not measure that second ray.
+ * **How it is read back.** Every ray of the scan reads 2 m but the second.
+ * The pose casts 1 m along compared ray 0 and nought along every other ray,
+ * which the metric skips. The sift's score is therefore 1 m where compared
+ * ray 0 reads the first ray, and the pose has no score at all where it reads
+ * missing.
+ * **The bound.** Compared ray 0 is the first ray's range and nothing else, so
+ * the score is 1 m exactly.
+ * **Both regimes, measured.** Where the ray beside it has to be measured for
+ * compared ray 0 to be read, though it carries no weight, ray 0 reads missing
+ * and the pose is refused as one the metric cannot grade. Where only the rays
+ * that carry weight have to be, the score is 1 m.
+ */
+TEST(Localiser, AnEndRayIsTakenWhenTheRayBesideItIsMissing)
+{
+  const double aperture = kEvenSensorRays * kSensorIncrement;
+  const double angle_min = -0.5 * (kEvenSensorRays - 1U) * kSensorIncrement;
+
+  const std::size_t panoramic =
+    FSM::panoramicRaysOf(kEvenSensorRays, aperture);
+  const std::size_t prefix = FSM::windowPrefixOf(panoramic, kEvenSensorRays);
+
+  const double first = 2.0;
+  const double compared = 1.0;
+
+  std::vector<double> measured(kEvenSensorRays, first);
+  measured[1] = std::numeric_limits<double>::quiet_NaN();
+
+  std::vector<double> cast(panoramic, 0.0);
+  cast[prefix] = compared;
+
+  const std::expected<Result, Error> result =
+    siftedFromOnePose(measured, cast, aperture, angle_min);
+
+  ASSERT_TRUE(result.has_value())
+    << "ray 0 of " << kEvenSensorRays << " rays from "
+    << angle_min * 180.0 / M_PI << " degrees is compared beyond the first "
+    << "ray and given its range, " << first << " m, but it read missing and "
+    << "the pose, which casts along ray 0 alone, could not be scored. The "
+    << "second ray was not measured and carries no weight in ray 0.";
+  ASSERT_EQ(result->survivors.size(), 1U);
+
+  EXPECT_EQ(result->survivors.front().score, first - compared)
+    << "ray 0 is compared beyond the first ray and given its range, "
+    << first << " m, against a cast of " << compared << " m, but it lies "
+    << result->survivors.front().score << " m from it.";
+}
+
+/**
+ * @brief A pose the metric cannot grade is refused rather than reported, even
+ * where the refinement accepted it.
+ * @details This is the one refusal an occupancy grid cannot provoke, and it is
+ * reached here through a reference that is not one.
+ * **What the case asserts, and what it does not.** It asserts that the guard
+ * fires: a corrected pose whose own fresh cast shares no contributing ray with
+ * the measurement is refused, and no pose is reported. It asserts nothing about
+ * how a map behaves, because no occupancy grid can hold the contradiction the
+ * reference below stands for. A cast of zeros on every ray is what a caster
+ * reports for a sensor inside an obstacle, and a position inside an obstacle is
+ * not free, so a grid that answered as this reference answers would be
+ * disagreeing with itself.
+ * **Why an occupancy grid cannot reach it.** The matcher closes that route
+ * itself, and the translation bound has nothing to do with it: the translation
+ * stage tests every step it takes with the map's own free space test,
+ * `FSM::Utils::isPositionInMap`, which for a grid reference is that grid's own
+ * `isFree`. A step that would leave free space or leave the grid is turned into
+ * a recovery instead of being taken, and a survivor whose recoveries run out is
+ * refused rather than corrected. So a corrected pose is always on free space of
+ * the same map, and a cast from free space in a bounded room always meets a
+ * wall. This holds with the translation bound on and with it off, the check
+ * being a separate condition from the bound in the same statement.
+ * **The measurement behind that claim.** Eighty attempts were run before this
+ * case was written, over both fixture grids, five free cells hugging a border,
+ * four measurements chosen to send the matcher outward, and the translation
+ * bound both on and off: seventy seven answered and three were refused, not one
+ * corrected pose landed off free space, not one rescored to infinity, and the
+ * furthest any pose walked was 1.554 m. A future reader need not repeat it.
+ * **Why the guard is kept, and why this case is kept with it.** A localiser is
+ * constructed with a `std::shared_ptr<const FSM::GridReference>`, which is any
+ * reference a caller cares to stand behind that interface and not only an
+ * occupancy grid. The guard is what stops such a reference producing a
+ * confident answer out of a cast that met nothing, so it defends the boundary of
+ * a public interface rather than an internal impossibility. Without a case
+ * reaching it, the next reader has every reason to believe it unreachable and
+ * delete it.
+ * **The neighbouring refusal, for contrast.** A reference that casts every ray
+ * at the maximum range instead of at zero never reaches this guard: the matcher
+ * refuses such a survivor on its own first cast, and the run is refused for the
+ * refinement's reason.
+ * `AMapWithNothingInRangeIsRefusedBeforeAnUnscorablePoseCanWin` is that case,
+ * on a real grid.
+ */
+TEST(Localiser, AReferenceThatCastsNothingFromAFreePoseYieldsNoAnswer)
+{
+  const std::shared_ptr<const FSM::GridReference> reference =
+    std::make_shared<const FreeEverywhereCastingNothing>();
+
+  const Pose standing{.x = 1.0, .y = 2.0, .t = 0.3};
+
+  std::vector<double> measured(kRayCount);
+  for (unsigned int i = 0; i < kRayCount; i++)
+    measured[i] = 2.0 + std::sin(3.0 * i * 2*M_PI / kRayCount);
+
+  ASSERT_TRUE(std::ranges::all_of(measured,
+      [](const double range) { return range > 0.0; }))
+    << "the measurement must be one every ray of which the metric can count, "
+    << "so that what cannot be graded below is the cast and not the scan.";
+
+  const std::vector<double> cast =
+    reference->ranges(standing, kRayCount, kRangeMax);
+
+  ASSERT_TRUE(std::isinf(cbgl::caer(measured, cast, kRangeMax)))
+    << "a cast of zeros shares no contributing ray with the measurement, so "
+    << "the metric cannot grade it and scores it infinity. Without that this "
+    << "case is not about an unscorable pose at all.";
+
+  FreeSpace free_space;
+  free_space.resolution = 0.05;
+  free_space.cells.push_back(Point{.x = standing.x, .y = standing.y});
+
+  const Localiser localiser(parametersOf(kTopK), reference, free_space);
+
+  const std::vector<Pose> hypotheses{standing};
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, hypotheses, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "the pose the run would have reported cannot be graded by the very "
+    << "metric the run selects by, so there is nothing to report. Reporting it "
+    << "anyway would publish a pose chosen by a comparison that never "
+    << "happened.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::no_scorable_pose);
+
+  EXPECT_TRUE(result.error().refusals.empty())
+    << "the refinement accepted every survivor it was handed here, the "
+    << "reference calling every position free, so the refusal comes from the "
+    << "selection rather than from the refinement and there is no refusal of "
+    << "the matcher's to count. A count here would name the wrong stage.";
+}
+
+/**
+ * @brief A scan carrying no rays at all is refused, and refused for its length.
+ * @details The ROS 1 build read the first range of a scan before establishing
+ * that the scan carried one, so a message with an empty range vector read
+ * before the start of it. Nothing here indexes a scan: the node copies the
+ * whole vector and the library asks only for its size. This case pins the
+ * degenerate end of that, an empty scan being simply the shortest scan there
+ * is, so it is refused by the same rule and under the same reason as any other
+ * scan too short to reduce.
+ * @remark The neighbouring case refuses a scan of a tenth of the rays the
+ * matcher asks for. That one shows the rule works; this one shows it does not
+ * stop working at zero, which is where an index would have been read.
+ */
+TEST(Localiser, AScanCarryingNoRaysAtAllIsRefused)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::vector<double> no_rays;
+
+  const std::expected<Result, Error> result =
+    localiser.localise(no_rays, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "the matcher is set to " << kRayCount << " rays and the scan carries "
+    << "none, so there is nothing to reduce and nothing to score against.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::scan_too_short)
+    << "an empty scan is the shortest scan there is, so it is refused for its "
+    << "length rather than for carrying no usable range: the second would "
+    << "suggest the rays were there and unusable.";
+}
+
+/**
+ * @brief A scan carrying more rays than the matcher asks for is reduced to that
+ * many, and the pose is still recovered.
+ * @details Every other case here over a whole turn hands in no more rays than
+ * `size_scan` asks for, which leaves untouched the branch that interpolates a
+ * scan and resamples it. A real sensor reports whatever it reports and the
+ * parameter decides what the run works at, so that branch carries every run
+ * of a scan finer than the setting.
+ * The bound is the two cells of a scan the map itself cast, and it is the same
+ * bound for the same reason: reducing a cast of twice as many rays onto this
+ * many is the coarser cast itself. Ray `i` of `n` leaves a pose at
+ * `i * 2*M_PI / n + pose.t - M_PI`, so ray `2 * j` of a cast of `2 * n` leaves
+ * at `j * 2*M_PI / n + pose.t - M_PI`, which is ray `j` of the cast of `n`. The
+ * two therefore differ by no more than the rounding of one of those
+ * expressions against the other, and nothing about the search should notice
+ * which of the two it was handed.
+ */
+TEST(Localiser, AScanOfMoreRaysThanTheMatcherAsksForIsReducedAndStillRecovers)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_fine.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no first pose to read and nothing for this case to localise towards.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+  ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+  const Parameters parameters = parametersOf(kTopK);
+  const unsigned int rays = 2U * kRayCount;
+
+  ASSERT_GT(rays, parameters.matcher.size_scan)
+    << "the scan must carry more rays than the matcher asks for, or the "
+    << "reduction this case exists for never runs.";
+
+  const std::vector<double> measured = map->ranges(truth, rays, kRangeMax);
+  ASSERT_EQ(measured.size(), rays);
+
+  const double resolution = map->resolution();
+  const double cells = 2.0;
+
+  const Localiser localiser(parameters, map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(result.has_value())
+    << "the scan was cast from this very map at a pose inside the room, at "
+    << rays << " rays rather than at the " << parameters.matcher.size_scan
+    << " the matcher works at, and the run produced no pose at all.";
+
+  EXPECT_NEAR(result->pose.x, truth.x, cells * resolution)
+    << "a scan of " << rays << " rays reduced to "
+    << parameters.matcher.size_scan << " is the cast the map would have given "
+    << "at " << parameters.matcher.size_scan << " rays, every other ray of the "
+    << "finer cast being a ray of the coarser one, so the answer is held to "
+    << "the same " << cells << " cells of " << resolution << " metres as a "
+    << "scan handed in at that size. The search placed the sensor at ("
+    << result->pose.x << ", " << result->pose.y << ") where the truth is ("
+    << truth.x << ", " << truth.y << ").";
+  EXPECT_NEAR(result->pose.y, truth.y, cells * resolution);
+
+  EXPECT_LE(headingError(result->pose.t, truth.t),
+    headingBound(measured, resolution, cells))
+    << "the scan was cast at a heading of " << truth.t << " radians and the "
+    << "search reported " << result->pose.t << ".";
+}
+
+TEST(Localiser, AScanShorterThanTheMatcherAsksForIsRefused)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::vector<double> too_short(kRayCount / 36U, 1.0);
+
+  const std::expected<Result, Error> result =
+    localiser.localise(too_short, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "the matcher is set to " << kRayCount << " rays and the scan carries "
+    << too_short.size() << ", so it cannot be reduced to the size every stage "
+    << "of the run works at.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::scan_too_short);
+}
+
+/**
+ * @brief The other side of the seam: a scan neither layer is entitled to refuse.
+ * @details The two rules the seam is made of are each a boundary, and a copy of
+ * a rule can be wrong by refusing too much as easily as by refusing too little.
+ * Exactly `size_scan` rays is the shortest scan that is not too short, and one
+ * usable ray is the least a scan can carry and still carry something, so this is
+ * the scan that stands one step inside both rules at once. Neither layer may
+ * call it short and neither may call it unusable, whatever else either of them
+ * then makes of it.
+ * @remark What the run goes on to report is not asserted. A scan of one usable
+ * ray is interpolated into a scan of one range repeated, which describes a
+ * circular room and not this one, so where the search puts the sensor is not
+ * something this case has any business pinning.
+ */
+TEST(Localiser, AScanTheSeamHasNoBusinessRefusingIsRefusedByNeitherLayer)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no free pose to hand the matcher.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+  ASSERT_TRUE(map->isFree(truth.x, truth.y))
+    << "the estimate handed to the matcher must stand on free space, or it "
+    << "refuses for that instead and the case measures the wrong rule.";
+
+  const Parameters parameters = parametersOf(kTopK);
+
+  std::vector<double> ranges(parameters.matcher.size_scan, 0.0);
+  ranges[ranges.size() / 2] = 1.0;
+
+  ASSERT_EQ(std::ranges::count_if(ranges, fsm_localisation::isValidRange), 1)
+    << "the scan must carry exactly one usable range, that being one more than "
+    << "the entirely unusable scan the seam does refuse.";
+
+  const Corrector corrector(parameters.matcher, map);
+  const Localiser localiser(parameters, map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> library =
+    localiser.localise(ranges, kRangeMax, kFullTurn, -M_PI);
+
+  const bool library_called_it_short = !library.has_value() &&
+    library.error().reason == Error::Reason::scan_too_short;
+
+  EXPECT_FALSE(library_called_it_short)
+    << "the scan carries " << ranges.size() << " rays, which is exactly the "
+    << parameters.matcher.size_scan << " the matcher asks for, and this library "
+    << "refused it as shorter than that. The rule is fewer than, not fewer than "
+    << "or equal to.";
+
+  const bool library_called_it_unusable = !library.has_value() &&
+    library.error().reason == Error::Reason::scan_entirely_invalid;
+
+  EXPECT_FALSE(library_called_it_unusable)
+    << "one ray of the scan carries a usable range, so the scan does not carry "
+    << "nothing usable, and this library refused it as though it did. A copy of "
+    << "a rule that refuses one step too much throws away a scan a lidar can "
+    << "really produce.";
+
+  const std::expected<fsm_localisation::CorrectionResult, CorrectionError>
+    matcher = corrector.correct(ranges, truth, kRangeMax, 2.0 * M_PI, -M_PI);
+
+  const bool matcher_called_it_short = !matcher.has_value() &&
+    matcher.error() == CorrectionError::scan_too_short;
+
+  EXPECT_FALSE(matcher_called_it_short)
+    << "the matcher refused a scan of exactly the " << parameters.matcher.size_scan
+    << " rays it asks for as too short, so the two layers no longer agree on "
+    << "where the boundary of that rule is.";
+
+  const bool matcher_called_it_unusable = !matcher.has_value() &&
+    matcher.error() == CorrectionError::scan_entirely_invalid;
+
+  EXPECT_FALSE(matcher_called_it_unusable)
+    << "the matcher refused a scan carrying one usable range as carrying none, "
+    << "so the two layers no longer agree on what a usable range is.";
+}
+
+/**
+ * @brief A scan whose angles no sensor can report is refused, before it is
+ * read at a single angle.
+ * @details The node refuses each of these scans first. A caller handing a
+ * scan to the library directly passes no such gate, and the scan's first
+ * angle and aperture are what place every ray the scan is read at. A first
+ * angle not finite, or an aperture of nought or not a number, reaches an
+ * index of the scan through a conversion the language leaves undefined. A
+ * negative or an infinite aperture describes no sensor either.
+ * **Both regimes, measured.** Without the refusal, every one of the seven
+ * was refused as a run whose every survivor the matcher refused, which
+ * names the refinement and not the scan. With it, each is refused for its
+ * angles.
+ */
+TEST(Localiser, AScanWhoseAnglesNoSensorReportsIsRefused)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::vector<double> measured(kRayCount, 1.0);
+
+  const double not_a_number = std::numeric_limits<double>::quiet_NaN();
+  const double infinity = std::numeric_limits<double>::infinity();
+
+  struct Angles
+  {
+    const char* label{""};
+    double aperture{0.0};
+    double angle_min{0.0};
+  };
+
+  const Angles every[] = {
+    Angles{.label = "a first angle not a number", .aperture = kFullTurn,
+      .angle_min = not_a_number},
+    Angles{.label = "a first angle of plus infinity", .aperture = kFullTurn,
+      .angle_min = infinity},
+    Angles{.label = "a first angle of minus infinity", .aperture = kFullTurn,
+      .angle_min = -infinity},
+    Angles{.label = "an aperture of nought", .aperture = 0.0,
+      .angle_min = -M_PI},
+    Angles{.label = "a negative aperture", .aperture = -kFullTurn,
+      .angle_min = -M_PI},
+    Angles{.label = "an aperture not a number", .aperture = not_a_number,
+      .angle_min = -M_PI},
+    Angles{.label = "an infinite aperture", .aperture = infinity,
+      .angle_min = -M_PI}};
+
+  for (const Angles& angles : every)
+  {
+    const std::expected<Result, Error> result = localiser.localise(
+      measured, kRangeMax, angles.aperture, angles.angle_min);
+
+    const bool refused_for_its_angles = !result.has_value() &&
+      result.error().reason == Error::Reason::scan_angles_invalid;
+
+    const std::string outcome = result.has_value()
+      ? "answered with a pose"
+      : "refused for reason " +
+        std::to_string(static_cast<int>(result.error().reason));
+
+    EXPECT_TRUE(refused_for_its_angles)
+      << "a scan of " << kRayCount << " rays with " << angles.label << " was "
+      << outcome << ", where its angles describe no sensor and it is refused "
+      << "for them.";
+  }
+}
+
+TEST(Localiser, AScanWithNoUsableRangeIsRefused)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::vector<double> unusable(kRayCount, 0.0);
+
+  const std::expected<Result, Error> result =
+    localiser.localise(unusable, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "every ray of the scan is zero, which is one of the three ways a lidar "
+    << "reports a ray it could not trust, so the scan carries no distance to "
+    << "match against anything.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::scan_entirely_invalid);
+}
+
+/**
+ * @brief A whole turn whose first ray is reported at plus pi is read as the
+ * same turn reported from minus pi, the two being one angle.
+ * @details
+ * **The scene.** `kRayCount` rays a degree apart, every one reading 2 m but a
+ * run of forty that the sensor did not measure. The pose casts 1 m along
+ * every ray, so the sift's score is the number of rays it compared.
+ * **The two scans.** The same ranges twice, the first angle once minus pi and
+ * once plus pi, each rounded to a 32 bit float as a `sensor_msgs` scan
+ * carries it. The node takes the two for the same angle and lets both
+ * through. Every ray of either lies where the window compares the ray of the
+ * same index, a turn apart for the second.
+ * **The bound.** The two are one scan, so the sift compares the same rays of
+ * both: 320, the gap skipped.
+ * **Both regimes, measured.** Where the test of whether the rays lie on their
+ * compared angles does not wrap the turn, the scan from plus pi fails it by a
+ * whole turn and is read at its compared angles. Plus pi as a float lies
+ * 8.7e-8 radians beyond pi, so every compared ray falls just short of the
+ * sensor's ray of its index and reads the ray before it too. The gap grows by
+ * one ray and the scan is sifted over 319. With the turn wrapped, it is
+ * sifted over 320.
+ */
+TEST(Localiser, AWholeTurnFromPlusPiIsReadAsOneFromMinusPi)
+{
+  const std::size_t gap_begin = 100U;
+  const std::size_t gap_rays = 40U;
+
+  const std::vector<double> measured =
+    rangesWithAGap(kRayCount, 2.0, gap_begin, gap_rays);
+
+  const std::vector<double> cast(kRayCount, 1.0);
+
+  const double minus_pi = static_cast<float>(-M_PI);
+  const double plus_pi = static_cast<float>(M_PI);
+
+  const std::expected<Result, Error> from_minus =
+    siftedFromOnePose(measured, cast, kFullTurn, minus_pi);
+  const std::expected<Result, Error> from_plus =
+    siftedFromOnePose(measured, cast, kFullTurn, plus_pi);
+
+  ASSERT_TRUE(from_minus.has_value());
+  ASSERT_TRUE(from_plus.has_value());
+  ASSERT_EQ(from_minus->survivors.size(), 1U);
+  ASSERT_EQ(from_plus->survivors.size(), 1U);
+
+  const double minus_count = from_minus->survivors.front().score;
+  const double plus_count = from_plus->survivors.front().score;
+
+  ASSERT_EQ(minus_count, static_cast<double>(kRayCount - gap_rays))
+    << "the scan from minus pi reaches the sift as the sensor gave it, so the "
+    << "sift skips its " << gap_rays << " missing rays and compares the rest. "
+    << "Without that this case holds the other scan against nothing.";
+
+  EXPECT_EQ(plus_count, minus_count)
+    << "the scan from plus pi was sifted over " << plus_count << " rays, "
+    << "where the same scan from minus pi was sifted over " << minus_count
+    << ". A turn from plus pi lays every ray where the window compares the "
+    << "ray of its index, as a turn from minus pi does.";
+}
+
+/**
+ * @brief A scan of a whole turn is read between its last ray and its first
+ * where it is compared between them.
+ * @details
+ * **The scene.** `kRayCount` rays a degree apart from -179.5 degrees, half a
+ * ray off where the window compares them, so the scan is read at the angles
+ * it is compared at. Ray 0 is compared at -180 degrees, half way between the
+ * sensor's last ray, at 179.5, and its first, at -179.5. A sensor that does
+ * not see all the way round has an end there and nothing beyond it. A whole
+ * turn has no end: its last and first rays are a ray apart, as any two
+ * neighbours are.
+ * **How it is read back.** Every ray of the scan reads 2 m but the last,
+ * which reads 4 m. The pose casts 3 m along ray 0, the mean of the two, and
+ * nought along every other ray, which the metric skips. The sift's score is
+ * therefore how far the range compared at -180 degrees lies from that mean.
+ * **The bound.** Giving ray 0 the first ray's range alone puts it 1 m from
+ * the mean. The bound is half that.
+ * **Both regimes, measured.** With ray 0 given the first ray's range, as an
+ * end ray of a narrower sensor is, the score is 1 m. Read between the last
+ * ray and the first, it is 1.2e-14 m, the rounding of the angles.
+ */
+TEST(Localiser, AWholeTurnIsReadBetweenItsLastRayAndItsFirst)
+{
+  const double increment = kFullTurn / kRayCount;
+  const double angle_min = -M_PI + 0.5 * increment;
+
+  const double first = 2.0;
+  const double last = 4.0;
+  const double mean = 0.5 * (first + last);
+
+  std::vector<double> measured(kRayCount, first);
+  measured.back() = last;
+
+  std::vector<double> cast(kRayCount, 0.0);
+  cast.front() = mean;
+
+  const std::expected<Result, Error> result =
+    siftedFromOnePose(measured, cast, kFullTurn, angle_min);
+
+  ASSERT_TRUE(result.has_value())
+    << "a scan every ray of which is usable, sifted from a pose that casts "
+    << "something along ray 0, produced no answer.";
+  ASSERT_EQ(result->survivors.size(), 1U);
+
+  const double bound = 0.5 * std::abs(mean - first);
+
+  EXPECT_LE(result->survivors.front().score, bound)
+    << "ray 0 of a whole turn from " << angle_min * 180.0 / M_PI
+    << " degrees is compared at -180 degrees, between the last ray, which "
+    << "reads " << last << " m, and the first, which reads " << first
+    << " m. It lies " << result->survivors.front().score << " m from their "
+    << "mean, " << mean << " m. Given the first ray's range alone it would "
+    << "lie " << std::abs(mean - first) << " m from it, as though the scan "
+    << "ended there. The bound is half that, " << bound << " m.";
+}
+
+TEST(Localiser, EveryLocalisationOfTheSameScanGivesTheSameAnswer)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no first pose to read and nothing for this case to localise towards.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+
+  const std::vector<double> measured = map->ranges(truth, kRayCount, kRangeMax);
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> first =
+    localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+  const std::expected<Result, Error> second =
+    localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(first.has_value());
+  ASSERT_TRUE(second.has_value());
+
+  EXPECT_EQ(first->pose.x, second->pose.x)
+    << "the same scan localised twice by the same localiser, at a pinned seed, "
+    << "gave " << first->pose.x << " and then " << second->pose.x
+    << ". Nothing survives a call, so the second answer must repeat the first "
+    << "to the last bit; a difference means state was carried across, and the "
+    << "second localisation of a run then depends on the first.";
+  EXPECT_EQ(first->pose.y, second->pose.y);
+  EXPECT_EQ(first->pose.t, second->pose.t);
+
+  const Localiser second_localiser(
+    parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> elsewhere =
+    second_localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(elsewhere.has_value());
+
+  EXPECT_EQ(elsewhere->pose.x, first->pose.x)
+    << "a second localiser built from the same parameters and the same map "
+    << "answered differently, so a run cannot be repeated from its own "
+    << "configuration alone.";
+  EXPECT_EQ(elsewhere->pose.y, first->pose.y);
+  EXPECT_EQ(elsewhere->pose.t, first->pose.t);
+}
+
+TEST(Localiser, EverySurvivorRefusedByTheMatcherRefusesTheRun)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no first pose to read and nothing for this case to localise towards.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+
+  const std::vector<double> measured = map->ranges(truth, kRayCount, kRangeMax);
+
+  std::vector<Pose> in_the_wall;
+  for (unsigned int column = 0U; column < 4U; column++)
+  {
+    const WorldPoint centre = map->worldFromCell(CellCoordinates{
+      .column = column + 0.5, .row = 0.5});
+
+    ASSERT_FALSE(map->isFree(centre.x, centre.y))
+      << "cell (" << column << ", 0) is meant to be part of the room's own "
+      << "wall, and this case needs every hypothesis to stand off free space.";
+
+    in_the_wall.push_back(Pose{.x = centre.x, .y = centre.y, .t = 0.0});
+  }
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, in_the_wall, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(result.has_value())
+    << "every hypothesis handed in stands inside the room's wall, so the "
+    << "matcher refuses every survivor and there is no corrected pose to "
+    << "report. The ROS 1 build published one regardless, read from index "
+    << "minus one of its own list.";
+
+  EXPECT_EQ(result.error().reason, Error::Reason::every_survivor_refused);
+
+  const std::map<CorrectionError, unsigned int>& refusals =
+    result.error().refusals;
+
+  ASSERT_FALSE(refusals.empty())
+    << "a run refused for want of a single accepted survivor has to say how "
+    << "the refinement went wrong, or a host can report only that it did.";
+
+  EXPECT_EQ(refusals.count(CorrectionError::estimate_not_in_free_space), 1u)
+    << "every hypothesis stands off free space, which is the first thing the "
+    << "matcher checks, so that is the reason it must have counted.";
+
+  unsigned int counted = 0U;
+  for (const auto& refusal : refusals)
+    counted += refusal.second;
+
+  const std::size_t candidates = in_the_wall.size() * kOrientations;
+  const std::size_t survivors = std::min<std::size_t>(kTopK, candidates);
+
+  EXPECT_EQ(counted, survivors)
+    << "the refinement was handed " << survivors << " survivors and the "
+    << "refusals add up to " << counted << ". Every survivor was refused, so "
+    << "every one of them must be counted once under the reason it was refused "
+    << "for.";
+}
+
+TEST(Localiser, TheHypothesesDrawnAreTheHypothesesSearched)
+{
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no first pose to read and nothing for this case to localise towards.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+
+  const std::vector<double> measured = map->ranges(truth, kRayCount, kRangeMax);
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::size_t drawn = localiser.disperse().size();
+  ASSERT_GT(drawn, 0u);
+
+  const std::expected<Result, Error> result =
+    localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(result.has_value());
+
+  EXPECT_EQ(result->num_candidates, drawn * kOrientations)
+    << "the draw yields " << drawn << " positions and each is scored at "
+    << kOrientations << " orientations, so " << drawn * kOrientations
+    << " candidates are scored. The localisation reported "
+    << result->num_candidates << ". Localising without a hypothesis set of "
+    << "one's own is the same thing as drawing one and then localising from "
+    << "it, and at a pinned seed the two draws are the same draw.";
+
+  EXPECT_GT(result->execution_time, 0.0)
+    << "a run that took no measurable time did not happen. The execution time "
+    << "is what a host reports and what the two builds are compared on.";
+}
+
+/**
+ * @brief A scan narrower than a turn, matched at its own ray count, is not
+ * answered at a heading turned by where the window compares its rays.
+ * @details
+ * **The scene.** The sensor of `kEvenSensorRays` rays `kSensorIncrement`
+ * apart sees from each of the room's truth poses what a whole turn cast at
+ * half its spacing shows on every other ray: 2880 rays to the turn, kept from
+ * ray `(-133.875 + 180) / 0.125`, which is 369. The aperture is the ray count
+ * times the spacing, 268 degrees, which is how the node computes it.
+ * `size_scan` is nought, so the scan is not reduced to fewer rays and every
+ * stage compares 1072. The truth is handed in as the one hypothesis,
+ * so that the window decides the heading and the draw does not.
+ * **Where the rays are compared.** The window lays 1072 rays over 268 degrees
+ * as `round(1072 * 360 / 268)`, which is 1440 rays to the turn, and keeps them
+ * from ray `round((1440 - 1072) / 2)`, which is 184. Ray 0 is therefore
+ * compared at `-180 + 184 * 360 / 1440`, which is -134.000 degrees, where the
+ * sensor took it at -133.875. Every ray is compared 0.125 degrees, half the
+ * spacing, clockwise of where it was taken, so the answer turns by about as
+ * much to make the scan and the map agree.
+ * **Why this sensor.** Where the turn less the ray count is odd, the rounding
+ * of the prefix puts the middle of the window on the heading. Where it is
+ * even, the middle lies half a ray clockwise of it. A centred sensor of an
+ * even count has its own middle on the heading, so the window misplaces every
+ * one of its rays by half a ray. The real sensor's 1073 rays leave 367, odd,
+ * and lie on the window, as does every scan of a whole turn. One ray fewer is
+ * the least change that moves the sensor off it.
+ * **The bound.** Half of that misplacement, 0.0625 degrees, held against the
+ * lean: the signed heading error averaged over the room's three poses.
+ * **Both regimes, measured on both grids, which agree to the last digit
+ * shown.** With the scan compared ray for ray where the window lays it, the
+ * three poses lean +0.1259, +0.1679 and +0.1259 degrees: a lean of +0.140,
+ * above the bound. With the scan sampled at the angles its rays are compared
+ * at, by interpolating between the sensor's rays either side as a reduced
+ * scan is, they lean 0.0000, 0.0000 and 0.0000: a lean of 0.000, below it.
+ * @remark The lean is held to the bound rather than each pose, as in the
+ * reduced case. Here each pose would separate the two on its own as well.
+ */
+TEST_P(LocaliserOnAFineGrid, ANarrowerScanLeftUnreducedDoesNotLean)
+{
+  const GridCase grid = GetParam();
+
+  const GridFixture fixture = readGrid(grid.file);
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no lean to average.";
+
+  const double degrees = 180.0 / M_PI;
+
+  const double aperture = kEvenSensorRays * kSensorIncrement;
+  const double angle_min = -0.5 * (kEvenSensorRays - 1U) * kSensorIncrement;
+
+  const unsigned int cast_per_sensor_ray = 2U;
+  const double cast_increment = kSensorIncrement / cast_per_sensor_ray;
+
+  const double cast_turn = kFullTurn / cast_increment;
+  const double cast_first = (angle_min + M_PI) / cast_increment;
+
+  ASSERT_DOUBLE_EQ(cast_turn, std::round(cast_turn))
+    << "a turn is not a whole number of rays at half the sensor's spacing, so "
+    << "no cast of a whole turn lays a ray where every one of the sensor's "
+    << "rays lies.";
+  ASSERT_DOUBLE_EQ(cast_first, std::round(cast_first))
+    << "the sensor's first ray does not fall on a ray of the whole turn cast "
+    << "at half its spacing.";
+
+  const unsigned int rays_to_the_turn =
+    static_cast<unsigned int>(std::lround(cast_turn));
+  const std::size_t first = static_cast<std::size_t>(std::lround(cast_first));
+
+  const double window_turn =
+    std::round(kEvenSensorRays * kFullTurn / aperture);
+  const double window_first =
+    std::round((window_turn - kEvenSensorRays) / 2.0);
+
+  const double compared = -M_PI + window_first * kFullTurn / window_turn;
+  const double misplacement = angle_min - compared;
+  const double bound = misplacement / 2.0;
+
+  Parameters parameters = parametersOf(kTopK);
+  parameters.matcher.size_scan = 0U;
+
+  const Localiser localiser(parameters, map, freeSpaceOfMap(*map));
+
+  const double resolution = map->resolution();
+  const double cells = 2.0;
+
+  std::vector<double> errors;
+  std::ostringstream each;
+
+  for (std::size_t s = 0; s < room_poses.size(); s++)
+  {
+    const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[s]);
+    ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+    const std::vector<double> turn =
+      map->ranges(truth, rays_to_the_turn, kRangeMax);
+
+    std::vector<double> measured(kEvenSensorRays);
+    for (std::size_t k = 0; k < measured.size(); k++)
+      measured[k] = turn[first + k * cast_per_sensor_ray];
+
+    const std::vector<Pose> hypotheses{truth};
+
+    const std::expected<Result, Error> result =
+      localiser.localise(measured, kRangeMax, hypotheses, aperture, angle_min);
+
+    ASSERT_TRUE(result.has_value())
+      << "truth pose " << s << " on the " << grid.label << " grid, handed in "
+      << "as the one hypothesis, produced no pose at all.";
+
+    ASSERT_NEAR(result->pose.x, truth.x, cells * resolution)
+      << "truth pose " << s << " on the " << grid.label << " grid was placed "
+      << "elsewhere, so its heading says nothing about the window.";
+    ASSERT_NEAR(result->pose.y, truth.y, cells * resolution);
+
+    errors.push_back(FSM::Utils::wrapAngle(result->pose.t - truth.t));
+    each << " " << errors.back() * degrees;
+  }
+
+  const double lean =
+    std::accumulate(errors.begin(), errors.end(), 0.0) / errors.size();
+
+  EXPECT_LE(std::abs(lean) * degrees, bound * degrees)
+    << "a scan of " << kEvenSensorRays << " rays over " << aperture * degrees
+    << " degrees, matched at that count, leans " << lean * degrees
+    << " degrees on the " << grid.label << " grid, the poses one by one"
+    << each.str() << ". Its ray 0 is compared at " << compared * degrees
+    << " degrees and the sensor took it at " << angle_min * degrees
+    << ", so a window that hands the one the other's range misplaces every "
+    << "ray by " << misplacement * degrees << " degrees and the answer turns "
+    << "to match. The bound is half that, " << bound * degrees << " degrees.";
+}
+
+/**
+ * @brief A scan narrower than a turn, reduced to fewer rays, is not answered
+ * at a heading turned by where the reduction put the rays it kept.
+ * @details
+ * **The scene.** The sensor of `kSensorRays` rays `kSensorIncrement` apart
+ * sees from each of the room's truth poses what a whole turn cast at its own
+ * spacing shows over the part of that turn it covers: 1440 rays to the turn,
+ * kept from ray `(-134 + 180) / 0.25`, which is 184. The aperture is the ray
+ * count times the spacing, 268.25 degrees, which is how the node computes it.
+ * The matcher asks for `kReducedRays`, and the truth is handed in as the one
+ * hypothesis, so that the reduction and what follows from it decide the
+ * heading and the draw does not.
+ * **Where the reduced rays are compared.** The window lays 269 rays over
+ * 268.25 degrees as `round(269 * 360 / 268.25)`, which is 361 rays to the
+ * turn, and keeps them from ray `round((361 - 269) / 2)`, which is 46. Reduced
+ * ray 0 is therefore compared at `-180 + 46 * 360 / 361`, which is -134.127
+ * degrees. A reduction that lays the scan over a whole turn hands reduced ray
+ * 0 the range of the sensor's first ray, taken at -134.000. That misplaces it
+ * by 0.127 degrees, and the rest of the reduced rays by about as much, so the
+ * answer turns by about as much to make the scan and the map agree.
+ * **The bound.** Half of that misplacement, 0.064 degrees, held against the
+ * lean: the signed heading error averaged over the room's three poses. A lean
+ * under half the misplacement is nearer to a scan read at its own angles than
+ * to the misplaced one.
+ * **Both regimes, measured on both grids, which agree to the last digit
+ * shown.** With the reduction that assumes a whole turn the three poses lean
+ * +0.1247, +0.1673 and +0.1673 degrees: a lean of +0.153, above the bound.
+ * With the scan sampled at the angles its reduced rays are compared at, by
+ * interpolating between the sensor's rays either side, they lean -0.0181,
+ * 0.0000 and -0.0426: a lean of -0.020, below it. Reduced ray 0 lies half a
+ * sensor ray outside the first ray, and those figures leave it missing. Given
+ * the first ray's range instead, the three are -0.0181, 0.0000 and +0.0714: a
+ * lean of +0.018.
+ * @remark No single pose is held to the bound. Sampling at the compared
+ * angles reached +0.0714 degrees on one pose, above it, and a bound set
+ * between that and the +0.1247 the reduction as it stands reached would sit
+ * under 0.03 degrees from either. The lean separates the two with more room
+ * on both sides.
+ */
+TEST_P(LocaliserOnAFineGrid, ANarrowerScanReducedToFewerRaysDoesNotLean)
+{
+  const GridCase grid = GetParam();
+
+  const GridFixture fixture = readGrid(grid.file);
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no lean to average.";
+
+  const double degrees = 180.0 / M_PI;
+
+  const double aperture = kSensorRays * kSensorIncrement;
+  const double angle_min = -0.5 * (kSensorRays - 1U) * kSensorIncrement;
+
+  const double sensor_turn = kFullTurn / kSensorIncrement;
+  const double sensor_first = (angle_min + M_PI) / kSensorIncrement;
+
+  ASSERT_DOUBLE_EQ(sensor_turn, std::round(sensor_turn))
+    << "a turn is not a whole number of the sensor's rays, so no cast of a "
+    << "whole turn lays a ray where every one of the sensor's rays lies.";
+  ASSERT_DOUBLE_EQ(sensor_first, std::round(sensor_first))
+    << "the sensor's first ray does not fall on a ray of the whole turn cast "
+    << "at its spacing.";
+
+  const unsigned int rays_to_the_turn =
+    static_cast<unsigned int>(std::lround(sensor_turn));
+  const std::size_t first = static_cast<std::size_t>(std::lround(sensor_first));
+
+  const double window_turn =
+    std::round(kReducedRays * kFullTurn / aperture);
+  const double window_first =
+    std::round((window_turn - kReducedRays) / 2.0);
+
+  const double compared = -M_PI + window_first * kFullTurn / window_turn;
+  const double misplacement = angle_min - compared;
+  const double bound = misplacement / 2.0;
+
+  Parameters parameters = parametersOf(kTopK);
+  parameters.matcher.size_scan = kReducedRays;
+
+  const Localiser localiser(parameters, map, freeSpaceOfMap(*map));
+
+  const double resolution = map->resolution();
+  const double cells = 2.0;
+
+  std::vector<double> errors;
+  std::ostringstream each;
+
+  for (std::size_t s = 0; s < room_poses.size(); s++)
+  {
+    const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[s]);
+    ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+    const std::vector<double> turn =
+      map->ranges(truth, rays_to_the_turn, kRangeMax);
+    const std::vector<double> measured(turn.begin() + first,
+      turn.begin() + first + kSensorRays);
+
+    const std::vector<Pose> hypotheses{truth};
+
+    const std::expected<Result, Error> result =
+      localiser.localise(measured, kRangeMax, hypotheses, aperture, angle_min);
+
+    ASSERT_TRUE(result.has_value())
+      << "truth pose " << s << " on the " << grid.label << " grid, handed in "
+      << "as the one hypothesis, produced no pose at all.";
+
+    ASSERT_NEAR(result->pose.x, truth.x, cells * resolution)
+      << "truth pose " << s << " on the " << grid.label << " grid was placed "
+      << "elsewhere, so its heading says nothing about the reduction.";
+    ASSERT_NEAR(result->pose.y, truth.y, cells * resolution);
+
+    errors.push_back(FSM::Utils::wrapAngle(result->pose.t - truth.t));
+    each << " " << errors.back() * degrees;
+  }
+
+  const double lean =
+    std::accumulate(errors.begin(), errors.end(), 0.0) / errors.size();
+
+  EXPECT_LE(std::abs(lean) * degrees, bound * degrees)
+    << "a scan of " << kSensorRays << " rays over " << aperture * degrees
+    << " degrees, reduced to " << kReducedRays << ", leans " << lean * degrees
+    << " degrees on the " << grid.label << " grid, the poses one by one"
+    << each.str() << ". Reduced ray 0 is compared at " << compared * degrees
+    << " degrees and the sensor's first ray was taken at "
+    << angle_min * degrees << ", so a reduction that hands the one the "
+    << "other's range misplaces it by " << misplacement * degrees
+    << " degrees and the answer turns to match. The bound is half that, "
+    << bound * degrees << " degrees.";
+}
+
+TEST_P(LocaliserOnAFineGrid, APoseIsRecoveredFromAScanTheMapNeverCast)
+{
+  const GridCase grid = GetParam();
+
+  const GridFixture fixture = readGrid(grid.file);
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  const std::vector<std::vector<double>> scans = readScans(kScansFixture);
+
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose.";
+  ASSERT_FALSE(scans.empty())
+    << "the scan fixture " << kScansFixture << " carried no scan. Two empty "
+    << "files agree on their count, so the comparison below would pass while "
+    << "the case measured nothing.";
+
+  ASSERT_EQ(scans.size(), room_poses.size());
+  ASSERT_EQ(scans[0].size(), kRayCount);
+
+  const double resolution = map->resolution();
+  const double cells = 4.0;
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  for (std::size_t s = 0; s < scans.size(); s++)
+  {
+    const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[s]);
+    ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+    const std::expected<Result, Error> result =
+      localiser.localise(scans[s], kRangeMax, kFullTurn, -M_PI);
+
+    ASSERT_TRUE(result.has_value())
+      << "scan " << s << " on the " << grid.label << " grid produced no pose "
+      << "at all, though it was cast from inside the very room the grid draws.";
+
+    EXPECT_NEAR(result->pose.x, truth.x, cells * resolution)
+      << "scan " << s << " was cast from the room's own polygons at ("
+      << truth.x << ", " << truth.y << ", " << truth.t << ") and the search "
+      << "placed the sensor at (" << result->pose.x << ", " << result->pose.y
+      << ", " << result->pose.t << ") on the " << grid.label << " grid. The "
+      << "bound is " << cells << " cells of " << resolution << " metres: a "
+      << "cell for what a grid can support at all, another " << std::sqrt(2.0)
+      << " for how far past a wall's face the ray marching caster can stop, "
+      << "half a cell for the centre of the cell the hypothesis was drawn at, "
+      << "and a cell of slack over the three.";
+    EXPECT_NEAR(result->pose.y, truth.y, cells * resolution);
+
+    EXPECT_LE(headingError(result->pose.t, truth.t),
+      headingBound(scans[s], resolution, cells))
+      << "scan " << s << " was cast at a heading of " << truth.t
+      << " radians and the search reported " << result->pose.t << ". A heading "
+      << "wrong by dt moves what the sensor would see at range r sideways by "
+      << "r * dt, so the bound is " << cells << " cells seen at the mean range "
+      << "this scan carries.";
+  }
+}
+
+TEST_P(LocaliserOnEveryGrid, APoseIsRecoveredFromAScanTheMapItselfCast)
+{
+  const GridCase grid = GetParam();
+
+  const GridFixture fixture = readGrid(grid.file);
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so the loop "
+    << "below would assert nothing at all.";
+
+  const double resolution = map->resolution();
+  const double cells = 2.0;
+
+  const Localiser localiser(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  for (std::size_t s = 0; s < room_poses.size(); s++)
+  {
+    const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[s]);
+    ASSERT_TRUE(map->isFree(truth.x, truth.y))
+      << "truth pose " << s << " of the room falls outside the free space of "
+      << "the " << grid.label << " grid, so the case is asking for a pose the "
+      << "search is not allowed to reach.";
+
+    const std::vector<double> measured =
+      map->ranges(truth, kRayCount, kRangeMax);
+
+    const std::expected<Result, Error> result =
+      localiser.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+    ASSERT_TRUE(result.has_value())
+      << "the measurement was cast from this very map at truth pose " << s
+      << ", so a candidate that agrees with it exactly exists wherever the "
+      << "draw reaches that cell, and the run produced no pose at all.";
+
+    ASSERT_FALSE(result->survivors.empty())
+      << "a successful run refined at least one survivor, so it must report at "
+      << "least one.";
+
+    EXPECT_LE(result->survivors.size(), kTopK)
+      << "the sift was asked for " << kTopK << " survivors and reported "
+      << result->survivors.size() << ".";
+
+    EXPECT_NEAR(result->pose.x, truth.x, cells * resolution)
+      << "truth pose " << s << " on the " << grid.label << " grid stands at ("
+      << truth.x << ", " << truth.y << ", " << truth.t << ") and the search "
+      << "placed the sensor at (" << result->pose.x << ", " << result->pose.y
+      << ", " << result->pose.t << "). The bound is " << cells << " cells of "
+      << resolution << " metres: one cell for what a map can support at all, "
+      << "since a ray stops at a cell, and one for the half cell diagonal "
+      << "between the truth and the centre of the cell a hypothesis is drawn "
+      << "at. A pose metres away is the wrong part of the room, which is what "
+      << "global localisation exists to get right.";
+    EXPECT_NEAR(result->pose.y, truth.y, cells * resolution);
+
+    EXPECT_LE(headingError(result->pose.t, truth.t),
+      headingBound(measured, resolution, cells))
+      << "truth pose " << s << " faces " << truth.t << " radians and the "
+      << "search reported " << result->pose.t << ". The bound is " << cells
+      << " cells seen at the mean range of this scan, a heading wrong by dt "
+      << "moving what the sensor would see at range r sideways by r * dt.";
+  }
+}
+
+/**
+ * @brief A refinement bounded to less than the cell it has to cross spends its
+ * whole recovery budget, and the run says so.
+ * @details
+ * This is the fifth and last of the matcher's refusals that a run through this
+ * library can meet. Four of the five are reached elsewhere in this file and in
+ * `test_parameters`: a scan too short and a scan carrying nothing usable are
+ * pinned on both sides of the seam by `ScanRefusalSeam`, a hypothesis standing
+ * off free space by `EverySurvivorRefusedByTheMatcherRefusesTheRun`, and a first
+ * cast that met nothing by
+ * `AMapWithNothingInRangeIsRefusedBeforeAnUnscorablePoseCanWin`.
+ * **Why a bound below the cell size is the honest way to reach it.** A survivor
+ * of the sift stands at the centre of a free cell, so the truth can be half a
+ * cell diagonal away from it, which is `resolution * sqrt(2) / 2`. The
+ * translation stage abandons a candidate that has moved further than `xy_bound`
+ * from where the stage began and treats that as a failure, and a failure is what
+ * starts a recovery. A bound of a quarter of that half diagonal therefore cannot
+ * reach the truth from where the sift left off, however good the measurement is:
+ * every attempt fails, every failure spends a recovery, and the budget runs out.
+ * Nothing about the room, the map or the scan is contrived to produce it. The
+ * scan is the cast the map itself gives at a pose of the fixture, which every
+ * other case in this file recovers from, and the only change is a translation
+ * bound a user could set by hand without noticing it was smaller than a cell.
+ * **What is asserted, and what is left alone.** Whether the run ends in a
+ * refusal or in an answer is not asserted, because it depends on how many of the
+ * ten survivors happen to run out first, and both endings were seen while this
+ * was written. What is asserted is the reason: every survivor the matcher turned
+ * down was turned down for a spent budget and for nothing else. The control is
+ * the same room, the same scan and the same seed at the bound this package
+ * ships, which refuses no survivor at all, so the case is about the bound rather
+ * than about the room.
+ */
+TEST_P(LocaliserOnEveryGrid, ATranslationBoundBelowACellSpendsTheRecoveryBudget)
+{
+  const GridCase grid = GetParam();
+
+  const GridFixture fixture = readGrid(grid.file);
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no pose to cast the measurement from.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+  ASSERT_TRUE(map->isFree(truth.x, truth.y));
+
+  const std::vector<double> measured = map->ranges(truth, kRayCount, kRangeMax);
+
+  const double resolution = map->resolution();
+  const double half_cell_diagonal = resolution * std::sqrt(2.0) / 2.0;
+
+  const Localiser generous(parametersOf(kTopK), map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> control =
+    generous.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_TRUE(control.has_value())
+    << "the control run, at the bound this package ships, produced no pose on "
+    << "the " << grid.label << " grid, so the room and the scan are the "
+    << "difficulty rather than the bound.";
+
+  EXPECT_TRUE(control->refusals.empty())
+    << "the control refused a survivor at the shipped bound of "
+    << parametersOf(kTopK).matcher.xy_bound << " metres, so what the tight "
+    << "bound below causes is not the whole of what is being measured.";
+
+  Parameters bounded = parametersOf(kTopK);
+  bounded.matcher.xy_bound = half_cell_diagonal / 4.0;
+
+  ASSERT_TRUE(cbgl::validate(bounded).empty())
+    << "a translation bound of " << bounded.matcher.xy_bound << " metres has to "
+    << "be a bound the parameters accept, or this case is about a refused "
+    << "configuration and not about a spent budget: " << cbgl::validate(bounded);
+
+  const Localiser tight(bounded, map, freeSpaceOfMap(*map));
+
+  const std::expected<Result, Error> result =
+    tight.localise(measured, kRangeMax, kFullTurn, -M_PI);
+
+  const std::map<CorrectionError, unsigned int>& refusals =
+    result.has_value() ? result->refusals : result.error().refusals;
+
+  unsigned int counted = 0U;
+  for (const auto& refusal : refusals)
+    counted += refusal.second;
+
+  ASSERT_GT(counted, 0u)
+    << "a refinement bounded to " << bounded.matcher.xy_bound << " metres on "
+    << "the " << grid.label << " grid, whose cells are " << resolution
+    << " metres and whose survivors therefore stand up to "
+    << half_cell_diagonal << " metres from the truth, refused nothing at all. "
+    << "The translation stage cannot have reached the truth from where the sift "
+    << "left off, so it either was not bounded or the failure it met was not "
+    << "counted.";
+
+  EXPECT_LE(counted, kTopK)
+    << "the refinement was handed at most " << kTopK << " survivors and "
+    << counted << " refusals were counted, so a survivor was counted twice.";
+
+  for (const auto& refusal : refusals)
+    EXPECT_EQ(refusal.first, CorrectionError::recovery_budget_exhausted)
+      << "a survivor was refused " << refusal.second << " times for something "
+      << "other than a spent recovery budget on the " << grid.label << " grid. "
+      << "The measurement is this map's own cast from a free cell, so nothing "
+      << "here is short, unusable, off free space or out of range: the only "
+      << "thing the tight bound can cause is a translation that fails, "
+      << "recovers, and runs out of recoveries.";
+}
+
+/**
+ * @brief The two scan refusals this library decides are the matcher's own
+ * refusals under another name, and must stay that way.
+ * @details A scan shorter than `size_scan`, and a scan carrying no usable range,
+ * are both refused here before a hypothesis is drawn, and both are refused again
+ * by `fsm_localisation::Corrector::correct` when a survivor reaches it. The
+ * duplication is deliberate: each is required to be a distinct reason of this
+ * library's own, and deferring to the matcher would report both as every
+ * survivor having been refused, which names the refinement for a fault in the
+ * measurement.
+ * Two definitions of one rule can part company. This pins them: the very scan
+ * this library refuses is handed to the matcher, and the matcher has to refuse it
+ * for its own equivalent reason. If the matcher ever changes what either means,
+ * this goes red rather than the two quietly disagreeing.
+ * **Every flavour, not one of each.** A lidar reports a ray it could not trust
+ * as zero, as infinity or as not-a-number, and a range below zero is no distance
+ * at all either. Each is a separate encoding of the same thing, and either layer
+ * could stop recognising one of them while still recognising the rest, so each is
+ * a case here rather than one standing in for all four. The length rule gets the
+ * boundary itself, one ray short of what the matcher asks for, rather than a scan
+ * so short that a rule off by one would still refuse it.
+ * The scan neither layer may refuse is
+ * `AScanTheSeamHasNoBusinessRefusingIsRefusedByNeitherLayer`, which is the same
+ * seam approached from inside.
+ */
+TEST_P(ScanRefusalSeam, AScanRefusedHereIsRefusedByTheMatcherForTheSameThing)
+{
+  const SeamCase seam = GetParam();
+
+  const GridFixture fixture = readGrid("pillar_room_grid_coarse.csv");
+  const std::shared_ptr<const OccupancyGridMap> map = mapOf(fixture);
+  ASSERT_NE(map, nullptr);
+
+  const std::vector<Pose> room_poses = readTruth(kTruthFixture);
+  ASSERT_FALSE(room_poses.empty())
+    << "the truth fixture " << kTruthFixture << " named no pose, so there is "
+    << "no free pose to hand the matcher.";
+
+  const Pose truth = worldFromRoom(*map, fixture.origin_yaw, room_poses[0]);
+  ASSERT_TRUE(map->isFree(truth.x, truth.y))
+    << "the estimate handed to the matcher must stand on free space, or it "
+    << "refuses for that instead and the case measures the wrong rule.";
+
+  const Parameters parameters = parametersOf(kTopK);
+
+  const Corrector corrector(parameters.matcher, map);
+  const Localiser localiser(parameters, map, freeSpaceOfMap(*map));
+
+  const std::vector<double> ranges(seam.rays, seam.range);
+
+  const std::expected<Result, Error> library =
+    localiser.localise(ranges, kRangeMax, kFullTurn, -M_PI);
+
+  ASSERT_FALSE(library.has_value())
+    << "a scan of " << seam.rays << " rays, each of them " << seam.range
+    << ", is one this library is required to refuse before a hypothesis is "
+    << "drawn, and it produced an answer instead.";
+
+  EXPECT_EQ(library.error().reason, seam.library)
+    << "the " << seam.label << " scan was refused for another of this library's "
+    << "reasons than the one it is about, so a host reading the sentence is "
+    << "sent to look at the wrong thing.";
+
+  const std::expected<fsm_localisation::CorrectionResult, CorrectionError>
+    matcher = corrector.correct(ranges, truth, kRangeMax, 2.0 * M_PI, -M_PI);
+
+  ASSERT_FALSE(matcher.has_value())
+    << "this library refuses the " << seam.label << " scan of " << seam.rays
+    << " rays and the matcher accepted it. The two no longer mean the same thing "
+    << "by the rule, and the earlier of the two checks is now guessing on the "
+    << "matcher's behalf.";
+
+  EXPECT_EQ(matcher.error(), seam.matcher)
+    << "the matcher refused the same scan for a different reason of its own, so "
+    << "what this library reports about the " << seam.label << " scan is no "
+    << "longer what the matcher would have called it.";
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  AtFiveCentimetreCells, LocaliserOnAFineGrid,
+  testing::ValuesIn(kFineGrids), gridCaseSuffix);
+
+INSTANTIATE_TEST_SUITE_P(
+  OverEveryFlavourTheSeamDecides, ScanRefusalSeam,
+  testing::ValuesIn(kSeamCases), seamCaseSuffix);
+
+INSTANTIATE_TEST_SUITE_P(
+  OverEveryGrid, LocaliserOnEveryGrid,
+  testing::ValuesIn(kEveryGrid), gridCaseSuffix);
